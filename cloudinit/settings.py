@@ -24,36 +24,36 @@
 CFG_ENV_NAME = "CLOUD_CFG"
 
 # This is expected to be a yaml formatted file
-CLOUD_CONFIG = '/etc/cloud/cloud.cfg'
+CLOUD_CONFIG = '/opt/freeware/etc/cloud/cloud.cfg'
 
 # What u get if no config is provided
 CFG_BUILTIN = {
     'datasource_list': [
         'NoCloud',
         'ConfigDrive',
-        'OpenNebula',
-        'Azure',
-        'AltCloud',
+        #'OpenNebula',
+        #'Azure',
+        #'AltCloud',
         'OVF',
-        'MAAS',
-        'GCE',
-        'OpenStack'
+        #'MAAS',
+        #'GCE',
+        'OpenStack',
         'Ec2',
-        'CloudSigma',
-        'CloudStack',
-        'SmartOS',
+        #'CloudSigma',
+        #'CloudStack',
+        #'SmartOS',
         # At the end to act as a 'catch' when none of the above work...
         'None',
     ],
     'def_log_file': '/var/log/cloud-init.log',
     'log_cfgs': [],
-    'syslog_fix_perms': 'syslog:adm',
+    'syslog_fix_perms': 'root:system',
     'system_info': {
         'paths': {
-            'cloud_dir': '/var/lib/cloud',
-            'templates_dir': '/etc/cloud/templates/',
+            'cloud_dir': '/opt/freeware/var/lib/cloud',
+            'templates_dir': '/opt/freeware/etc/cloud/templates/',
         },
-        'distro': 'ubuntu',
+        'distro': 'aix',
     },
     'vendor_data': {'enabled': True, 'prefix': []},
 }

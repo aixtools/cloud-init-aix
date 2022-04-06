@@ -21,20 +21,22 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import cloudinit.util as util
+import cloudinit.distros.aix_util as aix_util
+import os
 import re
 
 from prettytable import PrettyTable
 
 
 def netdev_info(empty=""):
-    fields = ("hwaddr", "addr", "bcast", "mask")
+    fields = ("hwaddr", "addr", "bcast", "mask", 'addr6')
     (ifcfg_out, _err) = util.subp(["ifconfig", "-a"])
     devs = {}
     for line in str(ifcfg_out).splitlines():
         if len(line) == 0:
             continue
         if line[0] not in ("\t", " "):
-            curdev = line.split()[0]
+            curdev = line.split()[0].replace(':', '')
             devs[curdev] = {"up": False}
             for field in fields:
                 devs[curdev][field] = ""
@@ -44,7 +46,7 @@ def netdev_info(empty=""):
         # If the output of ifconfig doesn't contain the required info in the
         # obvious place, use a regex filter to be sure.
         elif len(toks) > 1:
-            if re.search(r"flags=\d+<up,", toks[1]):
+            if re.search(r"flags=[a-zA-Z0-9,]+<up,", toks[1]):
                 devs[curdev]['up'] = True
 
         fieldpost = ""
@@ -65,22 +67,30 @@ def netdev_info(empty=""):
             # Couple the different items we're interested in with the correct
             # field since FreeBSD/CentOS/Fedora differ in the output.
             ifconfigfields = {
-                "addr:": "addr", "inet": "addr",
+                "addr:": "addr", "inet": "addr", "inet6": "addr",
                 "bcast:": "bcast", "broadcast": "bcast",
                 "mask:": "mask", "netmask": "mask",
                 "hwaddr": "hwaddr", "ether": "hwaddr",
             }
             for origfield, field in ifconfigfields.items():
                 target = "%s%s" % (field, fieldpost)
-                if devs[curdev].get(target, ""):
+                if target != 'addr6' and devs[curdev].get(target, ""):
                     continue
+                if target == 'addr6' and not devs[curdev].get(target, []):
+                    devs[curdev][target] = []
+                value = ""
                 if toks[i] == "%s" % origfield:
                     try:
-                        devs[curdev][target] = toks[i + 1]
+                        value = toks[i + 1]
                     except IndexError:
                         pass
                 elif toks[i].startswith("%s" % origfield):
-                    devs[curdev][target] = toks[i][len(field) + 1:]
+                    value = toks[i][len(field) + 1:]
+
+                if value and target == 'addr6':
+                    devs[curdev][target].append(value)
+                elif value:
+                    devs[curdev][target] = value
 
     if empty != "":
         for (_devname, dev) in devs.iteritems():
@@ -96,7 +106,7 @@ def route_info():
     routes = []
     entries = route_out.splitlines()[1:]
     for line in entries:
-        if not line:
+        if not line or "Route tree" in line:
             continue
         toks = line.split()
 
@@ -111,6 +121,9 @@ def route_info():
                 toks[0] == "Destination" or toks[0] == "Internet" or
                 toks[0] == "Internet6" or toks[0] == "Routing"):
             continue
+
+        if "U" in toks[1]:
+            toks.insert(1, "-")
 
         if len(toks) < 8:
             toks.append("-")
@@ -128,6 +141,12 @@ def route_info():
             'use': toks[6],
             'iface': toks[7],
         }
+
+        # Update the entry for aix output
+        if os.path.exists("/usr/sbin/lsattr"):
+            entry['genmask'] = aix_util.get_mask(toks[5])
+            entry['flags'] = toks[2]
+            entry['iface'] = toks[5]
 
         routes.append(entry)
     return routes
@@ -153,10 +172,12 @@ def netdev_pformat():
         lines.append(util.center("Net device info failed", '!', 80))
         netdev = None
     if netdev is not None:
-        fields = ['Device', 'Up', 'Address', 'Mask', 'Hw-Address']
+        fields = ['Device', 'Up', 'Address', 'Mask', 'Hw-Address',
+                  'IPv6 Addresses']
         tbl = PrettyTable(fields)
         for (dev, d) in netdev.iteritems():
-            tbl.add_row([dev, d["up"], d["addr"], d["mask"], d["hwaddr"]])
+            tbl.add_row([dev, d["up"], d["addr"], d["mask"], d["hwaddr"],
+                         d['addr6']])
         netdev_s = tbl.get_string()
         max_len = len(max(netdev_s.splitlines(), key=len))
         header = util.center("Net device info", "+", max_len)
@@ -181,7 +202,14 @@ def route_pformat():
                         r['gateway'], r['genmask'],
                         r['iface'], r['flags']])
         route_s = tbl.get_string()
-        max_len = len(max(route_s.splitlines(), key=len))
+        # If the route info command has rc = 0 and returns no route
+        # information the routes list will be empty.
+        # Older versions of PrettyTable do not print empty tables and the
+        # max_len calculation below fails.  Set max_len to 80 in this case.
+        if route_s:
+            max_len = len(max(route_s.splitlines(), key=len))
+        else:
+            max_len = 80
         header = util.center("Route info", "+", max_len)
         lines.extend([header, route_s])
     return "\n".join(lines)
