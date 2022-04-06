@@ -646,8 +646,8 @@ def fetch_ssl_details(paths=None):
     ssl_details = {}
     # Lookup in these locations for ssl key/cert files
     ssl_cert_paths = [
-        '/var/lib/cloud/data/ssl',
-        '/var/lib/cloud/instance/data/ssl',
+        '/opt/freeware/var/lib/cloud/data/ssl',
+        '/opt/freeware/var/lib/cloud/instance/data/ssl',
     ]
     if paths:
         ssl_cert_paths.extend([
@@ -1433,6 +1433,14 @@ def uptime():
             contents = load_file("/proc/uptime").strip()
             if contents:
                 uptime_str = contents.split()[0]
+        elif os.path.exists("/usr/sbin/acct/fwtmp"): # for AIX support
+            method = '/usr/sbin/acct/fwtmp'
+            import commands
+            contents = commands.getoutput('/usr/sbin/acct/fwtmp < /var/adm/wtmp | /usr/bin/grep "system boot" 2>/dev/null')
+            if contents:
+                bootup = contents.splitlines()[-1].split()[6]
+                now = time.time()
+                uptime_str = now - float(bootup)
         else:
             method = 'ctypes'
             libc = ctypes.CDLL('/lib/libc.so.7')

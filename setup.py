@@ -41,12 +41,14 @@ INITSYS_FILES = {
     'sysvinit_deb': [f for f in glob('sysvinit/debian/*') if is_f(f)],
     'systemd': [f for f in glob('systemd/*') if is_f(f)],
     'upstart': [f for f in glob('upstart/*') if is_f(f)],
+    'aix': [f for f in glob('sysvinit/aix/*') if is_f(f)],
 }
 INITSYS_ROOTS = {
     'sysvinit': '/etc/rc.d/init.d',
     'sysvinit_deb': '/etc/init.d',
     'systemd': '/etc/systemd/system/',
     'upstart': '/etc/init/',
+    'aix': '/etc/rc.d/init.d',
 }
 INITSYS_TYPES = sorted(list(INITSYS_ROOTS.keys()))
 
@@ -125,7 +127,8 @@ setuptools.setup(name='cloud-init',
                   ('/usr/share/cloud-init', []),
                   ('/usr/lib/cloud-init',
                     ['tools/uncloud-init',
-                     'tools/write-ssh-key-fingerprints']),
+                     'tools/write-ssh-key-fingerprints',
+                     'tools/create_pvid_to_vg_mappings.sh']),
                   ('/usr/share/doc/cloud-init',
                    [f for f in glob('doc/*') if is_f(f)]),
                   ('/usr/share/doc/cloud-init/examples',

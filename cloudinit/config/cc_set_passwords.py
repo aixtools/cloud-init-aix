@@ -93,8 +93,12 @@ def handle(_name, cfg, cloud, log, args):
             expired_users = []
             for u in users:
                 try:
-                    util.subp(['passwd', '--expire', u])
-                    expired_users.append(u)
+                    if cloud.distro.name == "aix":
+                        util.subp(['/usr/bin/pwdadm', '-f', 'ADMCHG', u])
+                        expired_users.append(u)
+                    else:
+                        util.subp(['passwd', '--expire', u])
+                        expired_users.append(u)
                 except Exception as e:
                     errors.append(e)
                     util.logexc(log, "Failed to set 'expire' for %s", u)
@@ -136,13 +140,22 @@ def handle(_name, cfg, cloud, log, args):
         util.write_file(ssh_util.DEF_SSHD_CFG, "\n".join(lines))
 
         try:
-            cmd = cloud.distro.init_cmd  # Default service
-            cmd.append(cloud.distro.get_option('ssh_svcname', 'ssh'))
-            cmd.append('restart')
-            if 'systemctl' in cmd:  # Switch action ordering
-                cmd[1], cmd[2] = cmd[2], cmd[1]
-            cmd = filter(None, cmd)  # Remove empty arguments
-            util.subp(cmd)
+            if cloud.distro.name == "aix":
+                cmd = ['/usr/bin/stopsrc', '-s', 'sshd']
+                # Allow 0 and 1 return codes since it will return 1 if sshd is
+                # currently down.
+                util.subp(cmd, rcs=[0, 1])
+                cmd = ['/usr/bin/startsrc', '-s', 'sshd']
+                util.subp(cmd)
+                
+            else:
+                cmd = cloud.distro.get_init_cmd()
+                cmd.append(cloud.distro.get_option('ssh_svcname', 'ssh'))
+                cmd.append('restart')
+                if 'systemctl' in cmd:  # Switch action ordering
+                    cmd[1], cmd[2] = cmd[2], cmd[1]
+                cmd = filter(None, cmd)  # Remove empty arguments
+                util.subp(cmd)
             log.debug("Restarted the ssh daemon")
         except:
             util.logexc(log, "Restarting of the ssh daemon failed")
