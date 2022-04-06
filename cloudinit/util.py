@@ -1,37 +1,21 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Canonical Ltd.
+# Copyright (C) 2012, 2013 Hewlett-Packard Development Company, L.P.
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Canonical Ltd.
-#    Copyright (C) 2012, 2013 Hewlett-Packard Development Company, L.P.
-#    Copyright (C) 2012 Yahoo! Inc.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
-# pylint: disable=C0302
-
-from StringIO import StringIO
+# This file is part of cloud-init. See LICENSE file for license information.
 
 import contextlib
 import copy as obj_copy
-import ctypes
-import errno
+import email
 import glob
 import grp
 import gzip
 import hashlib
+import io
 import json
 import os
 import os.path
@@ -39,93 +23,144 @@ import platform
 import pwd
 import random
 import re
+import shlex
 import shutil
 import socket
 import stat
-import string  # pylint: disable=W0402
+import string
 import subprocess
 import sys
-import tempfile
 import time
-import urlparse
-
-import yaml
+from base64 import b64decode, b64encode
+from errno import ENOENT
+from functools import lru_cache
+from typing import List
+from urllib import parse
 
 from cloudinit import importer
 from cloudinit import log as logging
-from cloudinit import mergers
-from cloudinit import safeyaml
-from cloudinit import type_utils
-from cloudinit import url_helper
-from cloudinit import version
-
-from cloudinit.settings import (CFG_BUILTIN)
-
+from cloudinit import (
+    mergers,
+    safeyaml,
+    subp,
+    temp_utils,
+    type_utils,
+    url_helper,
+    version,
+)
+from cloudinit.settings import CFG_BUILTIN
 
 _DNS_REDIRECT_IP = None
 LOG = logging.getLogger(__name__)
 
 # Helps cleanup filenames to ensure they aren't FS incompatible
 FN_REPLACEMENTS = {
-    os.sep: '_',
+    os.sep: "_",
 }
-FN_ALLOWED = ('_-.()' + string.digits + string.ascii_letters)
+FN_ALLOWED = "_-.()" + string.digits + string.ascii_letters
 
-# Helper utils to see if running in a container
-CONTAINER_TESTS = ['running-in-container', 'lxc-is-container']
+TRUE_STRINGS = ("true", "1", "on", "yes")
+FALSE_STRINGS = ("off", "0", "no", "false")
 
 
-class ProcessExecutionError(IOError):
+def kernel_version():
+    return tuple(map(int, os.uname().release.split(".")[:2]))
 
-    MESSAGE_TMPL = ('%(description)s\n'
-                    'Command: %(cmd)s\n'
-                    'Exit code: %(exit_code)s\n'
-                    'Reason: %(reason)s\n'
-                    'Stdout: %(stdout)r\n'
-                    'Stderr: %(stderr)r')
 
-    def __init__(self, stdout=None, stderr=None,
-                 exit_code=None, cmd=None,
-                 description=None, reason=None):
-        if not cmd:
-            self.cmd = '-'
+@lru_cache()
+def get_dpkg_architecture(target=None):
+    """Return the sanitized string output by `dpkg --print-architecture`.
+
+    N.B. This function is wrapped in functools.lru_cache, so repeated calls
+    won't shell out every time.
+    """
+    out, _ = subp.subp(
+        ["dpkg", "--print-architecture"], capture=True, target=target
+    )
+    return out.strip()
+
+
+@lru_cache()
+def lsb_release(target=None):
+    fmap = {
+        "Codename": "codename",
+        "Description": "description",
+        "Distributor ID": "id",
+        "Release": "release",
+    }
+
+    data = {}
+    try:
+        out, _ = subp.subp(
+            ["lsb_release", "--all"], capture=True, target=target
+        )
+        for line in out.splitlines():
+            fname, _, val = line.partition(":")
+            if fname in fmap:
+                data[fmap[fname]] = val.strip()
+        missing = [k for k in fmap.values() if k not in data]
+        if len(missing):
+            LOG.warning(
+                "Missing fields in lsb_release --all output: %s",
+                ",".join(missing),
+            )
+
+    except subp.ProcessExecutionError as err:
+        LOG.warning("Unable to get lsb_release --all: %s", err)
+        data = dict((v, "UNAVAILABLE") for v in fmap.values())
+
+    return data
+
+
+def decode_binary(blob, encoding="utf-8"):
+    # Converts a binary type into a text type using given encoding.
+    if isinstance(blob, str):
+        return blob
+    return blob.decode(encoding)
+
+
+def encode_text(text, encoding="utf-8"):
+    # Converts a text string into a binary type using given encoding.
+    if isinstance(text, bytes):
+        return text
+    return text.encode(encoding)
+
+
+def b64d(source):
+    # Base64 decode some data, accepting bytes or unicode/str, and returning
+    # str/unicode if the result is utf-8 compatible, otherwise returning bytes.
+    decoded = b64decode(source)
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return decoded
+
+
+def b64e(source):
+    # Base64 encode some data, accepting bytes or unicode/str, and returning
+    # str/unicode if the result is utf-8 compatible, otherwise returning bytes.
+    if not isinstance(source, bytes):
+        source = source.encode("utf-8")
+    return b64encode(source).decode("utf-8")
+
+
+def fully_decoded_payload(part):
+    # In Python 3, decoding the payload will ironically hand us a bytes object.
+    # 'decode' means to decode according to Content-Transfer-Encoding, not
+    # according to any charset in the Content-Type.  So, if we end up with
+    # bytes, first try to decode to str via CT charset, and failing that, try
+    # utf-8 using surrogate escapes.
+    cte_payload = part.get_payload(decode=True)
+    if part.get_content_maintype() == "text" and isinstance(
+        cte_payload, bytes
+    ):
+        charset = part.get_charset()
+        if charset and charset.input_codec:
+            encoding = charset.input_codec
         else:
-            self.cmd = cmd
-
-        if not description:
-            self.description = 'Unexpected error while running command.'
-        else:
-            self.description = description
-
-        if not isinstance(exit_code, (long, int)):
-            self.exit_code = '-'
-        else:
-            self.exit_code = exit_code
-
-        if not stderr:
-            self.stderr = ''
-        else:
-            self.stderr = stderr
-
-        if not stdout:
-            self.stdout = ''
-        else:
-            self.stdout = stdout
-
-        if reason:
-            self.reason = reason
-        else:
-            self.reason = '-'
-
-        message = self.MESSAGE_TMPL % {
-            'description': self.description,
-            'cmd': self.cmd,
-            'exit_code': self.exit_code,
-            'stdout': self.stdout,
-            'stderr': self.stderr,
-            'reason': self.reason,
-        }
-        IOError.__init__(self, message)
+            encoding = "utf-8"
+        return cte_payload.decode(encoding, "surrogateescape")
+    return cte_payload
 
 
 class SeLinuxGuard(object):
@@ -133,7 +168,7 @@ class SeLinuxGuard(object):
         # Late import since it might not always
         # be possible to use this
         try:
-            self.selinux = importer.import_module('selinux')
+            self.selinux = importer.import_module("selinux")
         except ImportError:
             self.selinux = None
         self.path = path
@@ -146,23 +181,32 @@ class SeLinuxGuard(object):
             return False
 
     def __exit__(self, excp_type, excp_value, excp_traceback):
-        if self.selinux and self.selinux.is_selinux_enabled():
-            path = os.path.realpath(os.path.expanduser(self.path))
-            # path should be a string, not unicode
-            path = str(path)
-            do_restore = False
-            try:
-                # See if even worth restoring??
-                stats = os.lstat(path)
-                if stat.ST_MODE in stats:
-                    self.selinux.matchpathcon(path, stats[stat.ST_MODE])
-                    do_restore = True
-            except OSError:
-                pass
-            if do_restore:
-                LOG.debug("Restoring selinux mode for %s (recursive=%s)",
-                          path, self.recursive)
-                self.selinux.restorecon(path, recursive=self.recursive)
+        if not self.selinux or not self.selinux.is_selinux_enabled():
+            return
+        if not os.path.lexists(self.path):
+            return
+
+        path = os.path.realpath(self.path)
+        try:
+            stats = os.lstat(path)
+            self.selinux.matchpathcon(path, stats[stat.ST_MODE])
+        except OSError:
+            return
+
+        LOG.debug(
+            "Restoring selinux mode for %s (recursive=%s)",
+            path,
+            self.recursive,
+        )
+        try:
+            self.selinux.restorecon(path, recursive=self.recursive)
+        except OSError as e:
+            LOG.warning(
+                "restorecon failed on %s,%s maybe badness? %s",
+                path,
+                self.recursive,
+                e,
+            )
 
 
 class MountFailedError(Exception):
@@ -173,47 +217,33 @@ class DecompressionError(Exception):
     pass
 
 
-def ExtendedTemporaryFile(**kwargs):
-    fh = tempfile.NamedTemporaryFile(**kwargs)
-    # Replace its unlink with a quiet version
-    # that does not raise errors when the
-    # file to unlink has been unlinked elsewhere..
-    LOG.debug("Created temporary file %s", fh.name)
-    fh.unlink = del_file
-
-    # Add a new method that will unlink
-    # right 'now' but still lets the exit
-    # method attempt to remove it (which will
-    # not throw due to our del file being quiet
-    # about files that are not there)
-    def unlink_now():
-        fh.unlink(fh.name)
-
-    setattr(fh, 'unlink_now', unlink_now)
-    return fh
-
-
-def fork_cb(child_cb, *args):
+def fork_cb(child_cb, *args, **kwargs):
     fid = os.fork()
     if fid == 0:
         try:
-            child_cb(*args)
-            os._exit(0)  # pylint: disable=W0212
-        except:
-            logexc(LOG, "Failed forking and calling callback %s",
-                   type_utils.obj_name(child_cb))
-            os._exit(1)  # pylint: disable=W0212
+            child_cb(*args, **kwargs)
+            os._exit(0)
+        except Exception:
+            logexc(
+                LOG,
+                "Failed forking and calling callback %s",
+                type_utils.obj_name(child_cb),
+            )
+            os._exit(1)
     else:
-        LOG.debug("Forked child %s who will run callback %s",
-                  fid, type_utils.obj_name(child_cb))
+        LOG.debug(
+            "Forked child %s who will run callback %s",
+            fid,
+            type_utils.obj_name(child_cb),
+        )
 
 
 def is_true(val, addons=None):
     if isinstance(val, (bool)):
         return val is True
-    check_set = ['true', '1', 'on', 'yes']
+    check_set = TRUE_STRINGS
     if addons:
-        check_set = check_set + addons
+        check_set = list(check_set) + addons
     if str(val).lower().strip() in check_set:
         return True
     return False
@@ -222,9 +252,9 @@ def is_true(val, addons=None):
 def is_false(val, addons=None):
     if isinstance(val, (bool)):
         return val is False
-    check_set = ['off', '0', 'no', 'false']
+    check_set = FALSE_STRINGS
     if addons:
-        check_set = check_set + addons
+        check_set = list(check_set) + addons
     if str(val).lower().strip() in check_set:
         return True
     return False
@@ -242,16 +272,27 @@ def translate_bool(val, addons=None):
 
 
 def rand_str(strlen=32, select_from=None):
+    r = random.SystemRandom()
     if not select_from:
-        select_from = string.letters + string.digits
-    return "".join([random.choice(select_from) for _x in range(0, strlen)])
+        select_from = string.ascii_letters + string.digits
+    return "".join([r.choice(select_from) for _x in range(0, strlen)])
+
+
+def rand_dict_key(dictionary, postfix=None):
+    if not postfix:
+        postfix = ""
+    while True:
+        newkey = rand_str(strlen=8) + "_" + postfix
+        if newkey not in dictionary:
+            break
+    return newkey
 
 
 def read_conf(fname):
     try:
         return load_yaml(load_file(fname), default={})
     except IOError as e:
-        if e.errno == errno.ENOENT:
+        if e.errno == ENOENT:
             return {}
         else:
             raise
@@ -275,43 +316,47 @@ def uniq_merge_sorted(*lists):
 def uniq_merge(*lists):
     combined_list = []
     for a_list in lists:
-        if isinstance(a_list, (str, basestring)):
+        if isinstance(a_list, str):
             a_list = a_list.strip().split(",")
             # Kickout the empty ones
-            a_list = [a for a in a_list if len(a)]
+            a_list = [a for a in a_list if a]
         combined_list.extend(a_list)
     return uniq_list(combined_list)
 
 
 def clean_filename(fn):
-    for (k, v) in FN_REPLACEMENTS.iteritems():
+    for (k, v) in FN_REPLACEMENTS.items():
         fn = fn.replace(k, v)
     removals = []
     for k in fn:
         if k not in FN_ALLOWED:
             removals.append(k)
     for k in removals:
-        fn = fn.replace(k, '')
+        fn = fn.replace(k, "")
     fn = fn.strip()
     return fn
 
 
-def decomp_gzip(data, quiet=True):
+def decomp_gzip(data, quiet=True, decode=True):
     try:
-        buf = StringIO(str(data))
+        buf = io.BytesIO(encode_text(data))
         with contextlib.closing(gzip.GzipFile(None, "rb", 1, buf)) as gh:
-            return gh.read()
+            # E1101 is https://github.com/PyCQA/pylint/issues/1444
+            if decode:
+                return decode_binary(gh.read())  # pylint: disable=E1101
+            else:
+                return gh.read()  # pylint: disable=E1101
     except Exception as e:
         if quiet:
             return data
         else:
-            raise DecompressionError(str(e))
+            raise DecompressionError(str(e)) from e
 
 
 def extract_usergroup(ug_pair):
     if not ug_pair:
         return (None, None)
-    ug_parted = ug_pair.split(':', 1)
+    ug_parted = ug_pair.split(":", 1)
     u = ug_parted[0].strip()
     if len(ug_parted) == 2:
         g = ug_parted[1].strip()
@@ -324,7 +369,7 @@ def extract_usergroup(ug_pair):
     return (u, g)
 
 
-def find_modules(root_dir):
+def find_modules(root_dir) -> dict:
     entries = dict()
     for fname in glob.glob(os.path.join(root_dir, "*.py")):
         if not os.path.isfile(fname):
@@ -336,17 +381,23 @@ def find_modules(root_dir):
     return entries
 
 
-def multi_log(text, console=True, stderr=True,
-              log=None, log_level=logging.DEBUG):
+def multi_log(
+    text,
+    console=True,
+    stderr=True,
+    log=None,
+    log_level=logging.DEBUG,
+    fallback_to_stdout=True,
+):
     if stderr:
         sys.stderr.write(text)
     if console:
         conpath = "/dev/console"
         if os.path.exists(conpath):
-            with open(conpath, 'wb') as wfh:
+            with open(conpath, "w") as wfh:
                 wfh.write(text)
                 wfh.flush()
-        else:
+        elif fallback_to_stdout:
             # A container may lack /dev/console (arguably a container bug).  If
             # it does not exist, then write output to stdout.  this will result
             # in duplicate stderr and stdout messages if stderr was True.
@@ -363,27 +414,38 @@ def multi_log(text, console=True, stderr=True,
             log.log(log_level, text)
 
 
-def load_json(text, root_types=(dict,)):
-    decoded = json.loads(text)
-    if not isinstance(decoded, tuple(root_types)):
-        expected_types = ", ".join([str(t) for t in root_types])
-        raise TypeError("(%s) root types expected, got %s instead"
-                        % (expected_types, type(decoded)))
-    return decoded
+@lru_cache()
+def is_Linux():
+    return "Linux" in platform.system()
 
 
-def is_ipv4(instr):
-    """determine if input string is a ipv4 address. return boolean."""
-    toks = instr.split('.')
-    if len(toks) != 4:
-        return False
+@lru_cache()
+def is_BSD():
+    if "BSD" in platform.system():
+        return True
+    if platform.system() == "DragonFly":
+        return True
+    return False
 
-    try:
-        toks = [x for x in toks if int(x) < 256 and int(x) >= 0]
-    except:
-        return False
 
-    return len(toks) == 4
+@lru_cache()
+def is_FreeBSD():
+    return system_info()["variant"] == "freebsd"
+
+
+@lru_cache()
+def is_DragonFlyBSD():
+    return system_info()["variant"] == "dragonfly"
+
+
+@lru_cache()
+def is_NetBSD():
+    return system_info()["variant"] == "netbsd"
+
+
+@lru_cache()
+def is_OpenBSD():
+    return system_info()["variant"] == "openbsd"
 
 
 def get_cfg_option_bool(yobj, key, default=False):
@@ -396,19 +458,179 @@ def get_cfg_option_str(yobj, key, default=None):
     if key not in yobj:
         return default
     val = yobj[key]
-    if not isinstance(val, (str, basestring)):
+    if not isinstance(val, str):
         val = str(val)
     return val
 
 
+def get_cfg_option_int(yobj, key, default=0):
+    return int(get_cfg_option_str(yobj, key, default=default))
+
+
+def _parse_redhat_release(release_file=None):
+    """Return a dictionary of distro info fields from /etc/redhat-release.
+
+    Dict keys will align with /etc/os-release keys:
+        ID, VERSION_ID, VERSION_CODENAME
+    """
+
+    if not release_file:
+        release_file = "/etc/redhat-release"
+    if not os.path.exists(release_file):
+        return {}
+    redhat_release = load_file(release_file)
+    redhat_regex = (
+        r"(?P<name>.+) release (?P<version>[\d\.]+) "
+        r"\((?P<codename>[^)]+)\)"
+    )
+
+    # Virtuozzo deviates here
+    if "Virtuozzo" in redhat_release:
+        redhat_regex = r"(?P<name>.+) release (?P<version>[\d\.]+)"
+
+    match = re.match(redhat_regex, redhat_release)
+    if match:
+        group = match.groupdict()
+
+        # Virtuozzo has no codename in this file
+        if "Virtuozzo" in group["name"]:
+            group["codename"] = group["name"]
+
+        group["name"] = group["name"].lower().partition(" linux")[0]
+        if group["name"] == "red hat enterprise":
+            group["name"] = "redhat"
+        return {
+            "ID": group["name"],
+            "VERSION_ID": group["version"],
+            "VERSION_CODENAME": group["codename"],
+        }
+    return {}
+
+
+@lru_cache()
+def get_linux_distro():
+    distro_name = ""
+    distro_version = ""
+    flavor = ""
+    os_release = {}
+    os_release_rhel = False
+    if os.path.exists("/etc/os-release"):
+        os_release = load_shell_content(load_file("/etc/os-release"))
+    if not os_release:
+        os_release_rhel = True
+        os_release = _parse_redhat_release()
+    if os_release:
+        distro_name = os_release.get("ID", "")
+        distro_version = os_release.get("VERSION_ID", "")
+        if "sles" in distro_name or "suse" in distro_name:
+            # RELEASE_BLOCKER: We will drop this sles divergent behavior in
+            # the future so that get_linux_distro returns a named tuple
+            # which will include both version codename and architecture
+            # on all distributions.
+            flavor = platform.machine()
+        elif distro_name == "photon":
+            flavor = os_release.get("PRETTY_NAME", "")
+        elif distro_name == "virtuozzo" and not os_release_rhel:
+            # Only use this if the redhat file is not parsed
+            flavor = os_release.get("PRETTY_NAME", "")
+        else:
+            flavor = os_release.get("VERSION_CODENAME", "")
+            if not flavor:
+                match = re.match(
+                    r"[^ ]+ \((?P<codename>[^)]+)\)",
+                    os_release.get("VERSION", ""),
+                )
+                if match:
+                    flavor = match.groupdict()["codename"]
+        if distro_name == "rhel":
+            distro_name = "redhat"
+    elif is_BSD():
+        distro_name = platform.system().lower()
+        distro_version = platform.release()
+    else:
+        dist = ("", "", "")
+        try:
+            # Was removed in 3.8
+            dist = platform.dist()  # pylint: disable=W1505,E1101
+        except Exception:
+            pass
+        finally:
+            found = None
+            for entry in dist:
+                if entry:
+                    found = 1
+            if not found:
+                LOG.warning(
+                    "Unable to determine distribution, template "
+                    "expansion may have unexpected results"
+                )
+        return dist
+
+    return (distro_name, distro_version, flavor)
+
+
+def _get_variant(info):
+    system = info["system"].lower()
+    variant = "unknown"
+    if system == "linux":
+        linux_dist = info["dist"][0].lower()
+        if linux_dist in (
+            "almalinux",
+            "alpine",
+            "arch",
+            "centos",
+            "cloudlinux",
+            "debian",
+            "eurolinux",
+            "fedora",
+            "miraclelinux",
+            "openeuler",
+            "photon",
+            "rhel",
+            "rocky",
+            "suse",
+            "virtuozzo",
+        ):
+            variant = linux_dist
+        elif linux_dist in ("ubuntu", "linuxmint", "mint"):
+            variant = "ubuntu"
+        elif linux_dist == "redhat":
+            variant = "rhel"
+        elif linux_dist in (
+            "opensuse",
+            "opensuse-tumbleweed",
+            "opensuse-leap",
+            "sles",
+            "sle_hpc",
+        ):
+            variant = "suse"
+        else:
+            variant = "linux"
+    elif system in (
+        "windows",
+        "darwin",
+        "freebsd",
+        "netbsd",
+        "openbsd",
+        "dragonfly",
+    ):
+        variant = system
+
+    return variant
+
+
+@lru_cache()
 def system_info():
-    return {
-        'platform': platform.platform(),
-        'release': platform.release(),
-        'python': platform.python_version(),
-        'uname': platform.uname(),
-        'dist': platform.linux_distribution(),
+    info = {
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "release": platform.release(),
+        "python": platform.python_version(),
+        "uname": list(platform.uname()),
+        "dist": get_linux_distro(),
     }
+    info["variant"] = _get_variant(info)
+    return info
 
 
 def get_cfg_option_list(yobj, key, default=None):
@@ -423,7 +645,7 @@ def get_cfg_option_list(yobj, key, default=None):
     @return: The configuration option as a list of strings or default if key
         is not found.
     """
-    if not key in yobj:
+    if key not in yobj:
         return default
     if yobj[key] is None:
         return []
@@ -431,7 +653,7 @@ def get_cfg_option_list(yobj, key, default=None):
     if isinstance(val, (list)):
         cval = [v for v in val]
         return cval
-    if not isinstance(val, (basestring)):
+    if not isinstance(val, str):
         val = str(val)
     return [val]
 
@@ -439,6 +661,21 @@ def get_cfg_option_list(yobj, key, default=None):
 # get a cfg entry by its path array
 # for f['a']['b']: get_cfg_by_path(mycfg,('a','b'))
 def get_cfg_by_path(yobj, keyp, default=None):
+    """Return the value of the item at path C{keyp} in C{yobj}.
+
+    example:
+      get_cfg_by_path({'a': {'b': {'num': 4}}}, 'a/b/num') == 4
+      get_cfg_by_path({'a': {'b': {'num': 4}}}, 'c/d') == None
+
+    @param yobj: A dictionary.
+    @param keyp: A path inside yobj.  it can be a '/' delimited string,
+                 or an iterable.
+    @param default: The default to return if the path does not exist.
+    @return: The value of the item at keyp."
+        is not found."""
+
+    if isinstance(keyp, str):
+        keyp = keyp.split("/")
     cur = yobj
     for tok in keyp:
         if tok not in cur:
@@ -477,6 +714,26 @@ def redirect_output(outfmt, errfmt, o_out=None, o_err=None):
     if not o_err:
         o_err = sys.stderr
 
+    # pylint: disable=subprocess-popen-preexec-fn
+    def set_subprocess_umask_and_gid():
+        """Reconfigure umask and group ID to create output files securely.
+
+        This is passed to subprocess.Popen as preexec_fn, so it is executed in
+        the context of the newly-created process.  It:
+
+        * sets the umask of the process so created files aren't world-readable
+        * if an adm group exists in the system, sets that as the process' GID
+          (so that the created file(s) are owned by root:adm)
+        """
+        os.umask(0o037)
+        try:
+            group_id = grp.getgrnam("adm").gr_gid
+        except KeyError:
+            # No adm group, don't set a group
+            pass
+        else:
+            os.setgid(group_id)
+
     if outfmt:
         LOG.debug("Redirecting %s to %s", o_out, outfmt)
         (mode, arg) = outfmt.split(" ", 1)
@@ -486,8 +743,13 @@ def redirect_output(outfmt, errfmt, o_out=None, o_err=None):
                 owith = "wb"
             new_fp = open(arg, owith)
         elif mode == "|":
-            proc = subprocess.Popen(arg, shell=True, stdin=subprocess.PIPE)
-            new_fp = proc.stdin  # pylint: disable=E1101
+            proc = subprocess.Popen(
+                arg,
+                shell=True,
+                stdin=subprocess.PIPE,
+                preexec_fn=set_subprocess_umask_and_gid,
+            )
+            new_fp = proc.stdin
         else:
             raise TypeError("Invalid type for output format: %s" % outfmt)
 
@@ -508,8 +770,13 @@ def redirect_output(outfmt, errfmt, o_out=None, o_err=None):
                 owith = "wb"
             new_fp = open(arg, owith)
         elif mode == "|":
-            proc = subprocess.Popen(arg, shell=True, stdin=subprocess.PIPE)
-            new_fp = proc.stdin  # pylint: disable=E1101
+            proc = subprocess.Popen(
+                arg,
+                shell=True,
+                stdin=subprocess.PIPE,
+                preexec_fn=set_subprocess_umask_and_gid,
+            )
+            new_fp = proc.stdin
         else:
             raise TypeError("Invalid type for error format: %s" % errfmt)
 
@@ -517,26 +784,26 @@ def redirect_output(outfmt, errfmt, o_out=None, o_err=None):
             os.dup2(new_fp.fileno(), o_err.fileno())
 
 
-def make_url(scheme, host, port=None,
-                path='', params='', query='', fragment=''):
+def make_url(
+    scheme, host, port=None, path="", params="", query="", fragment=""
+):
 
-    pieces = []
-    pieces.append(scheme or '')
+    pieces = [scheme or ""]
 
-    netloc = ''
+    netloc = ""
     if host:
         netloc = str(host)
 
     if port is not None:
         netloc += ":" + "%s" % (port)
 
-    pieces.append(netloc or '')
-    pieces.append(path or '')
-    pieces.append(params or '')
-    pieces.append(query or '')
-    pieces.append(fragment or '')
+    pieces.append(netloc or "")
+    pieces.append(path or "")
+    pieces.append(params or "")
+    pieces.append(query or "")
+    pieces.append(fragment or "")
 
-    return urlparse.urlunparse(pieces)
+    return parse.urlunparse(pieces)
 
 
 def mergemanydict(srcs, reverse=False):
@@ -573,57 +840,15 @@ def umask(n_msk):
         os.umask(old)
 
 
-@contextlib.contextmanager
-def tempdir(**kwargs):
-    # This seems like it was only added in python 3.2
-    # Make it since its useful...
-    # See: http://bugs.python.org/file12970/tempdir.patch
-    tdir = tempfile.mkdtemp(**kwargs)
-    try:
-        yield tdir
-    finally:
-        del_dir(tdir)
-
-
 def center(text, fill, max_len):
-    return '{0:{fill}{align}{size}}'.format(text, fill=fill,
-                                            align="^", size=max_len)
+    return "{0:{fill}{align}{size}}".format(
+        text, fill=fill, align="^", size=max_len
+    )
 
 
 def del_dir(path):
     LOG.debug("Recursively deleting %s", path)
     shutil.rmtree(path)
-
-
-def runparts(dirp, skip_no_exist=True, exe_prefix=None):
-    if skip_no_exist and not os.path.isdir(dirp):
-        return
-
-    failed = []
-    attempted = []
-
-    if exe_prefix is None:
-        prefix = []
-    elif isinstance(exe_prefix, str):
-        prefix = [str(exe_prefix)]
-    elif isinstance(exe_prefix, list):
-        prefix = exe_prefix
-    else:
-        raise TypeError("exe_prefix must be None, str, or list")
-
-    for exe_name in sorted(os.listdir(dirp)):
-        exe_path = os.path.join(dirp, exe_name)
-        if os.path.isfile(exe_path) and os.access(exe_path, os.X_OK):
-            attempted.append(exe_path)
-            try:
-                subp(prefix + [exe_path], capture=False)
-            except ProcessExecutionError as e:
-                logexc(LOG, "Failed running %s [%s]", exe_path, e.exit_code)
-                failed.append(e)
-
-    if failed and attempted:
-        raise RuntimeError('Runparts: %s failures in %s attempted commands'
-                           % (len(failed), len(attempted)))
 
 
 # read_optional_seed
@@ -632,9 +857,10 @@ def runparts(dirp, skip_no_exist=True, exe_prefix=None):
 # 'meta-data' entries
 def read_optional_seed(fill, base="", ext="", timeout=5):
     try:
-        (md, ud) = read_seeded(base, ext, timeout)
-        fill['user-data'] = ud
-        fill['meta-data'] = md
+        (md, ud, vd) = read_seeded(base, ext, timeout)
+        fill["user-data"] = ud
+        fill["vendor-data"] = vd
+        fill["meta-data"] = md
         return True
     except url_helper.UrlError as e:
         if e.code == url_helper.NOT_FOUND:
@@ -646,114 +872,114 @@ def fetch_ssl_details(paths=None):
     ssl_details = {}
     # Lookup in these locations for ssl key/cert files
     ssl_cert_paths = [
-        '/opt/freeware/var/lib/cloud/data/ssl',
-        '/opt/freeware/var/lib/cloud/instance/data/ssl',
+        "/var/lib/cloud/data/ssl",
+        "/var/lib/cloud/instance/data/ssl",
     ]
     if paths:
-        ssl_cert_paths.extend([
-            os.path.join(paths.get_ipath_cur('data'), 'ssl'),
-            os.path.join(paths.get_cpath('data'), 'ssl'),
-        ])
+        ssl_cert_paths.extend(
+            [
+                os.path.join(paths.get_ipath_cur("data"), "ssl"),
+                os.path.join(paths.get_cpath("data"), "ssl"),
+            ]
+        )
     ssl_cert_paths = uniq_merge(ssl_cert_paths)
     ssl_cert_paths = [d for d in ssl_cert_paths if d and os.path.isdir(d)]
     cert_file = None
     for d in ssl_cert_paths:
-        if os.path.isfile(os.path.join(d, 'cert.pem')):
-            cert_file = os.path.join(d, 'cert.pem')
+        if os.path.isfile(os.path.join(d, "cert.pem")):
+            cert_file = os.path.join(d, "cert.pem")
             break
     key_file = None
     for d in ssl_cert_paths:
-        if os.path.isfile(os.path.join(d, 'key.pem')):
-            key_file = os.path.join(d, 'key.pem')
+        if os.path.isfile(os.path.join(d, "key.pem")):
+            key_file = os.path.join(d, "key.pem")
             break
     if cert_file and key_file:
-        ssl_details['cert_file'] = cert_file
-        ssl_details['key_file'] = key_file
+        ssl_details["cert_file"] = cert_file
+        ssl_details["key_file"] = key_file
     elif cert_file:
-        ssl_details['cert_file'] = cert_file
+        ssl_details["cert_file"] = cert_file
     return ssl_details
-
-
-def read_file_or_url(url, timeout=5, retries=10,
-                     headers=None, data=None, sec_between=1, ssl_details=None,
-                     headers_cb=None, exception_cb=None):
-    url = url.lstrip()
-    if url.startswith("/"):
-        url = "file://%s" % url
-    if url.lower().startswith("file://"):
-        if data:
-            LOG.warn("Unable to post data to file resource %s", url)
-        file_path = url[len("file://"):]
-        try:
-            contents = load_file(file_path)
-        except IOError as e:
-            code = e.errno
-            if e.errno == errno.ENOENT:
-                code = url_helper.NOT_FOUND
-            raise url_helper.UrlError(cause=e, code=code, headers=None)
-        return url_helper.FileResponse(file_path, contents=contents)
-    else:
-        return url_helper.readurl(url,
-                                  timeout=timeout,
-                                  retries=retries,
-                                  headers=headers,
-                                  headers_cb=headers_cb,
-                                  data=data,
-                                  sec_between=sec_between,
-                                  ssl_details=ssl_details,
-                                  exception_cb=exception_cb)
 
 
 def load_yaml(blob, default=None, allowed=(dict,)):
     loaded = default
+    blob = decode_binary(blob)
     try:
-        blob = str(blob)
-        LOG.debug(("Attempting to load yaml from string "
-                 "of length %s with allowed root types %s"),
-                 len(blob), allowed)
+        LOG.debug(
+            "Attempting to load yaml from string "
+            "of length %s with allowed root types %s",
+            len(blob),
+            allowed,
+        )
         converted = safeyaml.load(blob)
-        if not isinstance(converted, allowed):
+        if converted is None:
+            LOG.debug("loaded blob returned None, returning default.")
+            converted = default
+        elif not isinstance(converted, allowed):
             # Yes this will just be caught, but thats ok for now...
-            raise TypeError(("Yaml load allows %s root types,"
-                             " but got %s instead") %
-                            (allowed, type_utils.obj_name(converted)))
+            raise TypeError(
+                "Yaml load allows %s root types, but got %s instead"
+                % (allowed, type_utils.obj_name(converted))
+            )
         loaded = converted
-    except (yaml.YAMLError, TypeError, ValueError):
-        if len(blob) == 0:
-            LOG.debug("load_yaml given empty string, returning default")
+    except (safeyaml.YAMLError, TypeError, ValueError) as e:
+        msg = "Failed loading yaml blob"
+        mark = None
+        if hasattr(e, "context_mark") and getattr(e, "context_mark"):
+            mark = getattr(e, "context_mark")
+        elif hasattr(e, "problem_mark") and getattr(e, "problem_mark"):
+            mark = getattr(e, "problem_mark")
+        if mark:
+            msg += (
+                '. Invalid format at line {line} column {col}: "{err}"'.format(
+                    line=mark.line + 1, col=mark.column + 1, err=e
+                )
+            )
         else:
-            logexc(LOG, "Failed loading yaml blob")
+            msg += ". {err}".format(err=e)
+        LOG.warning(msg)
     return loaded
 
 
 def read_seeded(base="", ext="", timeout=5, retries=10, file_retries=0):
-    if base.startswith("/"):
-        base = "file://%s" % base
-
-    # default retries for file is 0. for network is 10
-    if base.startswith("file://"):
-        retries = file_retries
-
     if base.find("%s") >= 0:
         ud_url = base % ("user-data" + ext)
+        vd_url = base % ("vendor-data" + ext)
         md_url = base % ("meta-data" + ext)
     else:
         ud_url = "%s%s%s" % (base, "user-data", ext)
+        vd_url = "%s%s%s" % (base, "vendor-data", ext)
         md_url = "%s%s%s" % (base, "meta-data", ext)
 
-    md_resp = read_file_or_url(md_url, timeout, retries, file_retries)
+    md_resp = url_helper.read_file_or_url(
+        md_url, timeout=timeout, retries=retries
+    )
     md = None
     if md_resp.ok():
-        md_str = str(md_resp)
-        md = load_yaml(md_str, default={})
+        md = load_yaml(decode_binary(md_resp.contents), default={})
 
-    ud_resp = read_file_or_url(ud_url, timeout, retries, file_retries)
+    ud_resp = url_helper.read_file_or_url(
+        ud_url, timeout=timeout, retries=retries
+    )
     ud = None
     if ud_resp.ok():
-        ud_str = str(ud_resp)
-        ud = ud_str
+        ud = ud_resp.contents
 
-    return (md, ud)
+    vd = None
+    try:
+        vd_resp = url_helper.read_file_or_url(
+            vd_url, timeout=timeout, retries=retries
+        )
+    except url_helper.UrlError as e:
+        LOG.debug("Error in vendor-data response: %s", e)
+    else:
+        if vd_resp.ok():
+            vd = vd_resp.contents
+        else:
+            LOG.debug("Error in vendor-data response")
+
+    return (md, ud, vd)
 
 
 def read_conf_d(confd):
@@ -764,8 +990,7 @@ def read_conf_d(confd):
     confs = [f for f in confs if f.endswith(".cfg")]
 
     # Remove anything not a file
-    confs = [f for f in confs
-             if os.path.isfile(os.path.join(confd, f))]
+    confs = [f for f in confs if os.path.isfile(os.path.join(confd, f))]
 
     # Load them all so that they can be merged
     cfgs = []
@@ -780,12 +1005,13 @@ def read_conf_with_confd(cfgfile):
 
     confd = False
     if "conf_d" in cfg:
-        confd = cfg['conf_d']
+        confd = cfg["conf_d"]
         if confd:
-            if not isinstance(confd, (str, basestring)):
-                raise TypeError(("Config file %s contains 'conf_d' "
-                                 "with non-string type %s") %
-                                 (cfgfile, type_utils.obj_name(confd)))
+            if not isinstance(confd, str):
+                raise TypeError(
+                    "Config file %s contains 'conf_d' with non-string type %s"
+                    % (cfgfile, type_utils.obj_name(confd))
+                )
             else:
                 confd = str(confd).strip()
     elif os.path.isdir("%s.d" % cfgfile):
@@ -799,15 +1025,21 @@ def read_conf_with_confd(cfgfile):
     return mergemanydict([confd_cfg, cfg])
 
 
+def read_conf_from_cmdline(cmdline=None):
+    # return a dictionary of config on the cmdline or None
+    return load_yaml(read_cc_from_cmdline(cmdline=cmdline))
+
+
 def read_cc_from_cmdline(cmdline=None):
     # this should support reading cloud-config information from
     # the kernel command line.  It is intended to support content of the
     # format:
-    #  cc: <yaml content here> [end_cc]
+    #  cc: <yaml content here|urlencoded yaml content> [end_cc]
     # this would include:
     # cc: ssh_import_id: [smoser, kirkland]\\n
     # cc: ssh_import_id: [smoser, bob]\\nruncmd: [ [ ls, -l ], echo hi ] end_cc
     # cc:ssh_import_id: [smoser] end_cc cc:runcmd: [ [ ls, -l ] ] end_cc
+    # cc:ssh_import_id: %5Bsmoser%5D end_cc
     if cmdline is None:
         cmdline = get_cmdline()
 
@@ -822,43 +1054,52 @@ def read_cc_from_cmdline(cmdline=None):
         end = cmdline.find(tag_end, begin + begin_l)
         if end < 0:
             end = clen
-        tokens.append(cmdline[begin + begin_l:end].lstrip().replace("\\n",
-                                                                    "\n"))
-
+        tokens.append(
+            parse.unquote(cmdline[begin + begin_l : end].lstrip()).replace(
+                "\\n", "\n"
+            )
+        )
         begin = cmdline.find(tag_begin, end + end_l)
 
-    return '\n'.join(tokens)
+    return "\n".join(tokens)
 
 
 def dos2unix(contents):
     # find first end of line
-    pos = contents.find('\n')
-    if pos <= 0 or contents[pos - 1] != '\r':
+    pos = contents.find("\n")
+    if pos <= 0 or contents[pos - 1] != "\r":
         return contents
-    return contents.replace('\r\n', '\n')
+    return contents.replace("\r\n", "\n")
 
 
-def get_hostname_fqdn(cfg, cloud):
-    # return the hostname and fqdn from 'cfg'.  If not found in cfg,
-    # then fall back to data from cloud
+def get_hostname_fqdn(cfg, cloud, metadata_only=False):
+    """Get hostname and fqdn from config if present and fallback to cloud.
+
+    @param cfg: Dictionary of merged user-data configuration (from init.cfg).
+    @param cloud: Cloud instance from init.cloudify().
+    @param metadata_only: Boolean, set True to only query cloud meta-data,
+        returning None if not present in meta-data.
+    @return: a Tuple of strings <hostname>, <fqdn>. Values can be none when
+        metadata_only is True and no cfg or metadata provides hostname info.
+    """
     if "fqdn" in cfg:
         # user specified a fqdn.  Default hostname then is based off that
-        fqdn = cfg['fqdn']
-        hostname = get_cfg_option_str(cfg, "hostname", fqdn.split('.')[0])
+        fqdn = cfg["fqdn"]
+        hostname = get_cfg_option_str(cfg, "hostname", fqdn.split(".")[0])
     else:
-        if "hostname" in cfg and cfg['hostname'].find('.') > 0:
+        if "hostname" in cfg and cfg["hostname"].find(".") > 0:
             # user specified hostname, and it had '.' in it
             # be nice to them.  set fqdn and hostname from that
-            fqdn = cfg['hostname']
-            hostname = cfg['hostname'][:fqdn.find('.')]
+            fqdn = cfg["hostname"]
+            hostname = cfg["hostname"][: fqdn.find(".")]
         else:
             # no fqdn set, get fqdn from cloud.
             # get hostname from cfg if available otherwise cloud
-            fqdn = cloud.get_hostname(fqdn=True)
+            fqdn = cloud.get_hostname(fqdn=True, metadata_only=metadata_only)
             if "hostname" in cfg:
-                hostname = cfg['hostname']
+                hostname = cfg["hostname"]
             else:
-                hostname = cloud.get_hostname()
+                hostname = cloud.get_hostname(metadata_only=metadata_only)
     return (hostname, fqdn)
 
 
@@ -902,29 +1143,6 @@ def get_fqdn_from_hosts(hostname, filename="/etc/hosts"):
     return fqdn
 
 
-def get_cmdline_url(names=('cloud-config-url', 'url'),
-                    starts="#cloud-config", cmdline=None):
-    if cmdline is None:
-        cmdline = get_cmdline()
-
-    data = keyval_str_to_dict(cmdline)
-    url = None
-    key = None
-    for key in names:
-        if key in data:
-            url = data[key]
-            break
-
-    if not url:
-        return (None, None, None)
-
-    resp = read_file_or_url(url)
-    if resp.contents.startswith(starts) and resp.ok():
-        return (key, url, str(resp))
-
-    return (key, url, None)
-
-
 def is_resolvable(name):
     """determine if a url is resolvable, return a boolean
     This also attempts to be resilent against dns redirection.
@@ -934,19 +1152,23 @@ def is_resolvable(name):
     we have to append '.'.
 
     The top level 'invalid' domain is invalid per RFC.  And example.com
-    should also not exist.  The random entry will be resolved inside
-    the search list.
+    should also not exist.  The '__cloud_init_expected_not_found__' entry will
+    be resolved inside the search list.
     """
-    global _DNS_REDIRECT_IP  # pylint: disable=W0603
+    global _DNS_REDIRECT_IP
     if _DNS_REDIRECT_IP is None:
         badips = set()
-        badnames = ("does-not-exist.example.com.", "example.invalid.",
-                    rand_str())
+        badnames = (
+            "does-not-exist.example.com.",
+            "example.invalid.",
+            "__cloud_init_expected_not_found__",
+        )
         badresults = {}
         for iname in badnames:
             try:
-                result = socket.getaddrinfo(iname, None, 0, 0,
-                    socket.SOCK_STREAM, socket.AI_CANONNAME)
+                result = socket.getaddrinfo(
+                    iname, None, 0, 0, socket.SOCK_STREAM, socket.AI_CANONNAME
+                )
                 badresults[iname] = []
                 for (_fam, _stype, _proto, cname, sockaddr) in result:
                     badresults[iname].append("%s: %s" % (cname, sockaddr[0]))
@@ -982,7 +1204,12 @@ def gethostbyaddr(ip):
 
 def is_resolvable_url(url):
     """determine if this url is resolvable (existing or ip)."""
-    return is_resolvable(urlparse.urlparse(url).hostname)
+    return log_time(
+        logfunc=LOG.debug,
+        msg="Resolving URL: " + url,
+        func=is_resolvable,
+        args=(parse.urlparse(url).hostname,),
+    )
 
 
 def search_for_mirror(candidates):
@@ -990,9 +1217,14 @@ def search_for_mirror(candidates):
     Search through a list of mirror urls for one that works
     This needs to return quickly.
     """
+    if candidates is None:
+        return None
+
+    LOG.debug("search for mirror in candidates: '%s'", candidates)
     for cand in candidates:
         try:
             if is_resolvable_url(cand):
+                LOG.debug("found working mirror: '%s'", cand)
                 return cand
         except Exception:
             pass
@@ -1013,8 +1245,96 @@ def close_stdin():
         os.dup2(fp.fileno(), sys.stdin.fileno())
 
 
-def find_devs_with(criteria=None, oformat='device',
-                    tag=None, no_cache=False, path=None):
+def find_devs_with_freebsd(
+    criteria=None, oformat="device", tag=None, no_cache=False, path=None
+):
+    devlist = []
+    if not criteria:
+        return glob.glob("/dev/msdosfs/*") + glob.glob("/dev/iso9660/*")
+    if criteria.startswith("LABEL="):
+        label = criteria.lstrip("LABEL=")
+        devlist = [
+            p
+            for p in ["/dev/msdosfs/" + label, "/dev/iso9660/" + label]
+            if os.path.exists(p)
+        ]
+    elif criteria == "TYPE=vfat":
+        devlist = glob.glob("/dev/msdosfs/*")
+    elif criteria == "TYPE=iso9660":
+        devlist = glob.glob("/dev/iso9660/*")
+    return devlist
+
+
+def find_devs_with_netbsd(
+    criteria=None, oformat="device", tag=None, no_cache=False, path=None
+):
+    devlist = []
+    label = None
+    _type = None
+    if criteria:
+        if criteria.startswith("LABEL="):
+            label = criteria.lstrip("LABEL=")
+        if criteria.startswith("TYPE="):
+            _type = criteria.lstrip("TYPE=")
+    out, _err = subp.subp(["sysctl", "-n", "hw.disknames"], rcs=[0])
+    for dev in out.split():
+        if label or _type:
+            mscdlabel_out, _ = subp.subp(["mscdlabel", dev], rcs=[0, 1])
+        if label and not ('label "%s"' % label) in mscdlabel_out:
+            continue
+        if _type == "iso9660" and "ISO filesystem" not in mscdlabel_out:
+            continue
+        if _type == "vfat" and "ISO filesystem" in mscdlabel_out:
+            continue
+        devlist.append("/dev/" + dev)
+    return devlist
+
+
+def find_devs_with_openbsd(
+    criteria=None, oformat="device", tag=None, no_cache=False, path=None
+):
+    out, _err = subp.subp(["sysctl", "-n", "hw.disknames"], rcs=[0])
+    devlist = []
+    for entry in out.rstrip().split(","):
+        if not entry.endswith(":"):
+            # ffs partition with a serial, not a config-drive
+            continue
+        if entry == "fd0:":
+            continue
+        devlist.append(entry[:-1] + "a")
+        if not entry.startswith("cd"):
+            devlist.append(entry[:-1] + "i")
+    return ["/dev/" + i for i in devlist]
+
+
+def find_devs_with_dragonflybsd(
+    criteria=None, oformat="device", tag=None, no_cache=False, path=None
+):
+    out, _err = subp.subp(["sysctl", "-n", "kern.disks"], rcs=[0])
+    devlist = [
+        i
+        for i in sorted(out.split(), reverse=True)
+        if not i.startswith("md") and not i.startswith("vn")
+    ]
+
+    if criteria == "TYPE=iso9660":
+        devlist = [
+            i for i in devlist if i.startswith("cd") or i.startswith("acd")
+        ]
+    elif criteria in ["LABEL=CONFIG-2", "TYPE=vfat"]:
+        devlist = [
+            i
+            for i in devlist
+            if not (i.startswith("cd") or i.startswith("acd"))
+        ]
+    elif criteria:
+        LOG.debug("Unexpected criteria: %s", criteria)
+    return ["/dev/" + i for i in devlist]
+
+
+def find_devs_with(
+    criteria=None, oformat="device", tag=None, no_cache=False, path=None
+):
     """
     find devices matching given criteria (via blkid)
     criteria can be *one* of:
@@ -1022,7 +1342,18 @@ def find_devs_with(criteria=None, oformat='device',
       LABEL=<label>
       UUID=<uuid>
     """
-    blk_id_cmd = ['blkid']
+    if is_FreeBSD():
+        return find_devs_with_freebsd(criteria, oformat, tag, no_cache, path)
+    elif is_NetBSD():
+        return find_devs_with_netbsd(criteria, oformat, tag, no_cache, path)
+    elif is_OpenBSD():
+        return find_devs_with_openbsd(criteria, oformat, tag, no_cache, path)
+    elif is_DragonFlyBSD():
+        return find_devs_with_dragonflybsd(
+            criteria, oformat, tag, no_cache, path
+        )
+
+    blk_id_cmd = ["blkid"]
     options = []
     if criteria:
         # Search for block devices with tokens named NAME that
@@ -1044,12 +1375,19 @@ def find_devs_with(criteria=None, oformat='device',
         # Display blkid's output using the specified format.
         # The format parameter may be:
         # full, value, list, device, udev, export
-        options.append('-o%s' % (oformat))
+        options.append("-o%s" % (oformat))
     if path:
         options.append(path)
     cmd = blk_id_cmd + options
     # See man blkid for why 2 is added
-    (out, _err) = subp(cmd, rcs=[0, 2])
+    try:
+        (out, _err) = subp.subp(cmd, rcs=[0, 2])
+    except subp.ProcessExecutionError as e:
+        if e.errno == ENOENT:
+            # blkid not found...
+            out = ""
+        else:
+            raise
     entries = []
     for line in out.splitlines():
         line = line.strip()
@@ -1058,9 +1396,40 @@ def find_devs_with(criteria=None, oformat='device',
     return entries
 
 
+def blkid(devs=None, disable_cache=False):
+    """Get all device tags details from blkid.
+
+    @param devs: Optional list of device paths you wish to query.
+    @param disable_cache: Bool, set True to start with clean cache.
+
+    @return: Dict of key value pairs of info for the device.
+    """
+    if devs is None:
+        devs = []
+    else:
+        devs = list(devs)
+
+    cmd = ["blkid", "-o", "full"]
+    if disable_cache:
+        cmd.extend(["-c", "/dev/null"])
+    cmd.extend(devs)
+
+    # we have to decode with 'replace' as shelx.split (called by
+    # load_shell_content) can't take bytes.  So this is potentially
+    # lossy of non-utf-8 chars in blkid output.
+    out, _ = subp.subp(cmd, capture=True, decode="replace")
+    ret = {}
+    for line in out.splitlines():
+        dev, _, data = line.partition(":")
+        ret[dev] = load_shell_content(data)
+        ret[dev]["DEVNAME"] = dev
+
+    return ret
+
+
 def peek_file(fname, max_bytes):
     LOG.debug("Peeking at %s (max_bytes=%s)", fname, max_bytes)
-    with open(fname, 'rb') as ifh:
+    with open(fname, "rb") as ifh:
         return ifh.read(max_bytes)
 
 
@@ -1074,38 +1443,56 @@ def uniq_list(in_list):
     return out_list
 
 
-def load_file(fname, read_cb=None, quiet=False):
+def load_file(fname, read_cb=None, quiet=False, decode=True):
     LOG.debug("Reading from %s (quiet=%s)", fname, quiet)
-    ofh = StringIO()
+    ofh = io.BytesIO()
     try:
-        with open(fname, 'rb') as ifh:
+        with open(fname, "rb") as ifh:
             pipe_in_out(ifh, ofh, chunk_cb=read_cb)
     except IOError as e:
         if not quiet:
             raise
-        if e.errno != errno.ENOENT:
+        if e.errno != ENOENT:
             raise
     contents = ofh.getvalue()
     LOG.debug("Read %s bytes from %s", len(contents), fname)
-    return contents
+    if decode:
+        return decode_binary(contents)
+    else:
+        return contents
 
 
-def get_cmdline():
-    if 'DEBUG_PROC_CMDLINE' in os.environ:
-        cmdline = os.environ["DEBUG_PROC_CMDLINE"]
+@lru_cache()
+def _get_cmdline():
+    if is_container():
+        try:
+            contents = load_file("/proc/1/cmdline")
+            # replace nulls with space and drop trailing null
+            cmdline = contents.replace("\x00", " ")[:-1]
+        except Exception as e:
+            LOG.warning("failed reading /proc/1/cmdline: %s", e)
+            cmdline = ""
     else:
         try:
             cmdline = load_file("/proc/cmdline").strip()
-        except:
+        except Exception:
             cmdline = ""
+
     return cmdline
+
+
+def get_cmdline():
+    if "DEBUG_PROC_CMDLINE" in os.environ:
+        return os.environ["DEBUG_PROC_CMDLINE"]
+
+    return _get_cmdline()
 
 
 def pipe_in_out(in_fh, out_fh, chunk_size=1024, chunk_cb=None):
     bytes_piped = 0
     while True:
         data = in_fh.read(chunk_size)
-        if data == '':
+        if len(data) == 0:
             break
         else:
             out_fh.write(data)
@@ -1133,7 +1520,7 @@ def chownbyname(fname, user=None, group=None):
         if group:
             gid = grp.getgrnam(group).gr_gid
     except KeyError as e:
-        raise OSError("Unknown user or group: %s" % (e))
+        raise OSError("Unknown user or group: %s" % (e)) from e
     chownbyid(fname, uid, gid)
 
 
@@ -1148,18 +1535,18 @@ def chownbyname(fname, user=None, group=None):
 # this returns the specific 'mode' entry, cleanly formatted, with value
 def get_output_cfg(cfg, mode):
     ret = [None, None]
-    if not cfg or not 'output' in cfg:
+    if not cfg or "output" not in cfg:
         return ret
 
-    outcfg = cfg['output']
+    outcfg = cfg["output"]
     if mode in outcfg:
         modecfg = outcfg[mode]
     else:
-        if 'all' not in outcfg:
+        if "all" not in outcfg:
             return ret
         # if there is a 'all' item in the output list
         # then it applies to all users of this (init, config, final)
-        modecfg = outcfg['all']
+        modecfg = outcfg["all"]
 
     # if value is a string, it specifies stdout and stderr
     if isinstance(modecfg, str):
@@ -1175,10 +1562,10 @@ def get_output_cfg(cfg, mode):
     # if it is a dictionary, expect 'out' and 'error'
     # items, which indicate out and error
     if isinstance(modecfg, dict):
-        if 'output' in modecfg:
-            ret[0] = modecfg['output']
-        if 'error' in modecfg:
-            ret[1] = modecfg['error']
+        if "output" in modecfg:
+            ret[0] = modecfg["output"]
+        if "error" in modecfg:
+            ret[1] = modecfg["error"]
 
     # if err's entry == "&1", then make it same as stdout
     # as in shell syntax of "echo foo >/dev/null 2>&1"
@@ -1193,7 +1580,7 @@ def get_output_cfg(cfg, mode):
         found = False
         for s in swlist:
             if val.startswith(s):
-                val = "%s %s" % (s, val[len(s):].strip())
+                val = "%s %s" % (s, val[len(s) :].strip())
                 found = True
                 break
         if not found:
@@ -1204,20 +1591,53 @@ def get_output_cfg(cfg, mode):
     return ret
 
 
+def get_config_logfiles(cfg):
+    """Return a list of log file paths from the configuration dictionary.
+
+    @param cfg: The cloud-init merged configuration dictionary.
+    """
+    logs = []
+    if not cfg or not isinstance(cfg, dict):
+        return logs
+    default_log = cfg.get("def_log_file")
+    if default_log:
+        logs.append(default_log)
+    for fmt in get_output_cfg(cfg, None):
+        if not fmt:
+            continue
+        match = re.match(r"(?P<type>\||>+)\s*(?P<target>.*)", fmt)
+        if not match:
+            continue
+        target = match.group("target")
+        parts = target.split()
+        if len(parts) == 1:
+            logs.append(target)
+        elif ["tee", "-a"] == parts[:2]:
+            logs.append(parts[2])
+    return list(set(logs))
+
+
 def logexc(log, msg, *args):
     # Setting this here allows this to change
     # levels easily (not always error level)
     # or even desirable to have that much junk
     # coming out to a non-debug stream
     if msg:
-        log.warn(msg, *args)
-    # Debug gets the full trace
-    log.debug(msg, exc_info=1, *args)
+        log.warning(msg, *args)
+    # Debug gets the full trace.  However, nose has a bug whereby its
+    # logcapture plugin doesn't properly handle the case where there is no
+    # actual exception.  To avoid tracebacks during the test suite then, we'll
+    # do the actual exc_info extraction here, and if there is no exception in
+    # flight, we'll just pass in None.
+    exc_info = sys.exc_info()
+    if exc_info == (None, None, None):
+        exc_info = None
+    log.debug(msg, exc_info=exc_info, *args)
 
 
 def hash_blob(blob, routine, mlen=None):
     hasher = hashlib.new(routine)
-    hasher.update(blob)
+    hasher.update(encode_text(blob))
     digest = hasher.hexdigest()
     # Don't get to long now
     if mlen is not None:
@@ -1248,38 +1668,61 @@ def rename(src, dest):
     os.rename(src, dest)
 
 
-def ensure_dirs(dirlist, mode=0755):
+def ensure_dirs(dirlist, mode=0o755):
     for d in dirlist:
         ensure_dir(d, mode)
 
 
-def read_write_cmdline_url(target_fn):
-    if not os.path.exists(target_fn):
-        try:
-            (key, url, content) = get_cmdline_url()
-        except:
-            logexc(LOG, "Failed fetching command line url")
-            return
-        try:
-            if key and content:
-                write_file(target_fn, content, mode=0600)
-                LOG.debug(("Wrote to %s with contents of command line"
-                          " url %s (len=%s)"), target_fn, url, len(content))
-            elif key and not content:
-                LOG.debug(("Command line key %s with url"
-                          " %s had no contents"), key, url)
-        except:
-            logexc(LOG, "Failed writing url content to %s", target_fn)
+def load_json(text, root_types=(dict,)):
+    decoded = json.loads(decode_binary(text))
+    if not isinstance(decoded, tuple(root_types)):
+        expected_types = ", ".join([str(t) for t in root_types])
+        raise TypeError(
+            "(%s) root types expected, got %s instead"
+            % (expected_types, type(decoded))
+        )
+    return decoded
 
 
-def yaml_dumps(obj):
-    formatted = yaml.dump(obj,
-                    line_break="\n",
-                    indent=4,
-                    explicit_start=True,
-                    explicit_end=True,
-                    default_flow_style=False)
-    return formatted
+def json_serialize_default(_obj):
+    """Handler for types which aren't json serializable."""
+    try:
+        return "ci-b64:{0}".format(b64e(_obj))
+    except AttributeError:
+        return "Warning: redacted unserializable type {0}".format(type(_obj))
+
+
+def json_preserialize_binary(data):
+    """Preserialize any discovered binary values to avoid json.dumps issues.
+
+    Used only on python 2.7 where default type handling is not honored for
+    failure to encode binary data. LP: #1801364.
+    TODO(Drop this function when py2.7 support is dropped from cloud-init)
+    """
+    data = obj_copy.deepcopy(data)
+    for key, value in data.items():
+        if isinstance(value, (dict)):
+            data[key] = json_preserialize_binary(value)
+        if isinstance(value, bytes):
+            data[key] = "ci-b64:{0}".format(b64e(value))
+    return data
+
+
+def json_dumps(data):
+    """Return data in nicely formatted json."""
+    try:
+        return json.dumps(
+            data,
+            indent=1,
+            sort_keys=True,
+            separators=(",", ": "),
+            default=json_serialize_default,
+        )
+    except UnicodeDecodeError:
+        if sys.version_info[:2] == (2, 7):
+            data = json_preserialize_binary(data)
+            return json.dumps(data)
+        raise
 
 
 def ensure_dir(path, mode=None):
@@ -1299,8 +1742,8 @@ def unmounter(umount):
         yield umount
     finally:
         if umount:
-            umount_cmd = ["umount", '-l', umount]
-            subp(umount_cmd)
+            umount_cmd = ["umount", umount]
+            subp.subp(umount_cmd)
 
 
 def mounts():
@@ -1309,17 +1752,17 @@ def mounts():
         # Go through mounts to see what is already mounted
         if os.path.exists("/proc/mounts"):
             mount_locs = load_file("/proc/mounts").splitlines()
-            method = 'proc'
+            method = "proc"
         else:
-            (mountoutput, _err) = subp("mount")
+            (mountoutput, _err) = subp.subp("mount")
             mount_locs = mountoutput.splitlines()
-            method = 'mount'
-        mountre = r'^(/dev/[\S]+) on (/.*) \((.+), .+, (.+)\)$'
+            method = "mount"
+        mountre = r"^(/dev/[\S]+) on (/.*) \((.+), .+, (.+)\)$"
         for mpline in mount_locs:
             # Linux: /dev/sda1 on /boot type ext4 (rw,relatime,data=ordered)
             # FreeBSD: /dev/vtbd0p2 on / (ufs, local, journaled soft-updates)
             try:
-                if method == 'proc':
+                if method == "proc":
                     (dev, mp, fstype, opts, _freq, _passno) = mpline.split()
                 else:
                     m = re.search(mountre, mpline)
@@ -1327,15 +1770,15 @@ def mounts():
                     mp = m.group(2)
                     fstype = m.group(3)
                     opts = m.group(4)
-            except:
+            except Exception:
                 continue
             # If the name of the mount point contains spaces these
             # can be escaped as '\040', so undo that..
             mp = mp.replace("\\040", " ")
             mounted[dev] = {
-                'fstype': fstype,
-                'mountpoint': mp,
-                'opts': opts,
+                "fstype": fstype,
+                "mountpoint": mp,
+                "opts": opts,
             }
         LOG.debug("Fetched %s mounts from %s", mounted, method)
     except (IOError, OSError):
@@ -1343,42 +1786,83 @@ def mounts():
     return mounted
 
 
-def mount_cb(device, callback, data=None, rw=False, mtype=None, sync=True):
+def mount_cb(
+    device, callback, data=None, mtype=None, update_env_for_mount=None
+):
     """
     Mount the device, call method 'callback' passing the directory
     in which it was mounted, then unmount.  Return whatever 'callback'
     returned.  If data != None, also pass data to callback.
+
+    mtype is a filesystem type.  it may be a list, string (a single fsname)
+    or a list of fsnames.
     """
+
+    if isinstance(mtype, str):
+        mtypes = [mtype]
+    elif isinstance(mtype, (list, tuple)):
+        mtypes = list(mtype)
+    elif mtype is None:
+        mtypes = None
+    else:
+        raise TypeError(
+            "Unsupported type provided for mtype parameter: {_type}".format(
+                _type=type(mtype)
+            )
+        )
+
+    # clean up 'mtype' input a bit based on platform.
+    if is_Linux():
+        if mtypes is None:
+            mtypes = ["auto"]
+    elif is_BSD():
+        if mtypes is None:
+            mtypes = ["ufs", "cd9660", "msdos"]
+        for index, mtype in enumerate(mtypes):
+            if mtype == "iso9660":
+                mtypes[index] = "cd9660"
+            if mtype in ["vfat", "msdosfs"]:
+                mtypes[index] = "msdos"
+    else:
+        # we cannot do a smart "auto", so just call 'mount' once with no -t
+        mtypes = [""]
+
     mounted = mounts()
-    with tempdir() as tmpd:
+    with temp_utils.tempdir() as tmpd:
         umount = False
-        if device in mounted:
-            mountpoint = mounted[device]['mountpoint']
+        if os.path.realpath(device) in mounted:
+            mountpoint = mounted[os.path.realpath(device)]["mountpoint"]
         else:
-            try:
-                mountcmd = ['mount']
-                mountopts = []
-                if rw:
-                    mountopts.append('rw')
-                else:
-                    mountopts.append('ro')
-                if sync:
-                    # This seems like the safe approach to do
-                    # (ie where this is on by default)
-                    mountopts.append("sync")
-                if mountopts:
-                    mountcmd.extend(["-o", ",".join(mountopts)])
-                if mtype:
-                    mountcmd.extend(['-t', mtype])
-                mountcmd.append(device)
-                mountcmd.append(tmpd)
-                subp(mountcmd)
-                umount = tmpd  # This forces it to be unmounted (when set)
-                mountpoint = tmpd
-            except (IOError, OSError) as exc:
-                raise MountFailedError(("Failed mounting %s "
-                                        "to %s due to: %s") %
-                                       (device, tmpd, exc))
+            failure_reason = None
+            for mtype in mtypes:
+                mountpoint = None
+                try:
+                    mountcmd = ["mount", "-o", "ro"]
+                    if mtype:
+                        mountcmd.extend(["-t", mtype])
+                    mountcmd.append(device)
+                    mountcmd.append(tmpd)
+                    subp.subp(mountcmd, update_env=update_env_for_mount)
+                    umount = tmpd  # This forces it to be unmounted (when set)
+                    mountpoint = tmpd
+                    break
+                except (IOError, OSError) as exc:
+                    LOG.debug(
+                        "Failed to mount device: '%s' with type: '%s' "
+                        "using mount command: '%s', "
+                        "which caused exception: %s",
+                        device,
+                        mtype,
+                        " ".join(mountcmd),
+                        exc,
+                    )
+                    failure_reason = exc
+            if not mountpoint:
+                raise MountFailedError(
+                    "Failed mounting %s to %s due to: %s"
+                    % (device, tmpd, failure_reason)
+                )
+
         # Be nice and ensure it ends with a slash
         if not mountpoint.endswith("/"):
             mountpoint += "/"
@@ -1395,6 +1879,11 @@ def get_builtin_cfg():
     return obj_copy.deepcopy(CFG_BUILTIN)
 
 
+def is_link(path):
+    LOG.debug("Testing if a link exists for %s", path)
+    return os.path.islink(path)
+
+
 def sym_link(source, link, force=False):
     LOG.debug("Creating symbolic link from %r => %r", link, source)
     if force and os.path.exists(link):
@@ -1407,7 +1896,7 @@ def del_file(path):
     try:
         os.unlink(path)
     except OSError as e:
-        if e.errno != errno.ENOENT:
+        if e.errno != ENOENT:
             raise e
 
 
@@ -1419,41 +1908,61 @@ def copy(src, dest):
 def time_rfc2822():
     try:
         ts = time.strftime("%a, %d %b %Y %H:%M:%S %z", time.gmtime())
-    except:
+    except Exception:
         ts = "??"
     return ts
 
 
+@lru_cache()
+def boottime():
+    """Use sysctlbyname(3) via ctypes to find kern.boottime
+
+    kern.boottime is of type struct timeval. Here we create a
+    private class to easier unpack it.
+
+    @return boottime: float to be compatible with linux
+    """
+    import ctypes
+    import ctypes.util
+
+    NULL_BYTES = b"\x00"
+
+    class timeval(ctypes.Structure):
+        _fields_ = [("tv_sec", ctypes.c_int64), ("tv_usec", ctypes.c_int64)]
+
+    libc = ctypes.CDLL(ctypes.util.find_library("c"))
+    size = ctypes.c_size_t()
+    size.value = ctypes.sizeof(timeval)
+    buf = timeval()
+    if (
+        libc.sysctlbyname(
+            b"kern.boottime" + NULL_BYTES,
+            ctypes.byref(buf),
+            ctypes.byref(size),
+            None,
+            0,
+        )
+        != -1
+    ):
+        return buf.tv_sec + buf.tv_usec / 1000000.0
+    raise RuntimeError("Unable to retrieve kern.boottime on this system")
+
+
 def uptime():
-    uptime_str = '??'
-    method = 'unknown'
+    uptime_str = "??"
+    method = "unknown"
     try:
         if os.path.exists("/proc/uptime"):
-            method = '/proc/uptime'
-            contents = load_file("/proc/uptime").strip()
+            method = "/proc/uptime"
+            contents = load_file("/proc/uptime")
             if contents:
                 uptime_str = contents.split()[0]
-        elif os.path.exists("/usr/sbin/acct/fwtmp"): # for AIX support
-            method = '/usr/sbin/acct/fwtmp'
-            import commands
-            contents = commands.getoutput('/usr/sbin/acct/fwtmp < /var/adm/wtmp | /usr/bin/grep "system boot" 2>/dev/null')
-            if contents:
-                bootup = contents.splitlines()[-1].split()[6]
-                now = time.time()
-                uptime_str = now - float(bootup)
         else:
-            method = 'ctypes'
-            libc = ctypes.CDLL('/lib/libc.so.7')
-            size = ctypes.c_size_t()
-            buf = ctypes.c_int()
-            size.value = ctypes.sizeof(buf)
-            libc.sysctlbyname("kern.boottime", ctypes.byref(buf),
-                              ctypes.byref(size), None, 0)
-            now = time.time()
-            bootup = buf.value
-            uptime_str = now - bootup
+            method = "ctypes"
+            # This is the *BSD codepath
+            uptime_str = str(time.time() - boottime())
 
-    except:
+    except Exception:
         logexc(LOG, "Unable to read uptime using method: %s" % method)
     return uptime_str
 
@@ -1462,8 +1971,12 @@ def append_file(path, content):
     write_file(path, content, omode="ab", mode=None)
 
 
-def ensure_file(path, mode=0644):
-    write_file(path, content='', omode="ab", mode=mode)
+def ensure_file(
+    path, mode: int = 0o644, *, preserve_mode: bool = False
+) -> None:
+    write_file(
+        path, content="", omode="ab", mode=mode, preserve_mode=preserve_mode
+    )
 
 
 def safe_int(possible_int):
@@ -1480,19 +1993,117 @@ def chmod(path, mode):
             os.chmod(path, real_mode)
 
 
-def write_file(filename, content, mode=0644, omode="wb"):
+def get_group_id(grp_name: str) -> int:
+    """
+    Returns the group id of a group name, or -1 if no group exists
+
+    @param grp_name: the name of the group
+    """
+    gid = -1
+    try:
+        gid = grp.getgrnam(grp_name).gr_gid
+    except KeyError:
+        LOG.debug("Group %s is not a valid group name", grp_name)
+    return gid
+
+
+def get_permissions(path: str) -> int:
+    """
+    Returns the octal permissions of the file/folder pointed by the path,
+    encoded as an int.
+
+    @param path: The full path of the file/folder.
+    """
+
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def get_owner(path: str) -> str:
+    """
+    Returns the owner of the file/folder pointed by the path.
+
+    @param path: The full path of the file/folder.
+    """
+    st = os.stat(path)
+    return pwd.getpwuid(st.st_uid).pw_name
+
+
+def get_group(path: str) -> str:
+    """
+    Returns the group of the file/folder pointed by the path.
+
+    @param path: The full path of the file/folder.
+    """
+    st = os.stat(path)
+    return grp.getgrgid(st.st_gid).gr_name
+
+
+def get_user_groups(username: str) -> List[str]:
+    """
+    Returns a list of all groups to which the user belongs
+
+    @param username: the user we want to check
+    """
+    groups = []
+    for group in grp.getgrall():
+        if username in group.gr_mem:
+            groups.append(group.gr_name)
+
+    gid = pwd.getpwnam(username).pw_gid
+    groups.append(grp.getgrgid(gid).gr_name)
+    return groups
+
+
+def write_file(
+    filename,
+    content,
+    mode=0o644,
+    omode="wb",
+    preserve_mode=False,
+    *,
+    ensure_dir_exists=True
+):
     """
     Writes a file with the given content and sets the file mode as specified.
-    Resotres the SELinux context if possible.
+    Restores the SELinux context if possible.
 
     @param filename: The full path of the file to write.
     @param content: The content to write to the file.
     @param mode: The filesystem mode to set on the file.
-    @param omode: The open mode used when opening the file (r, rb, a, etc.)
+    @param omode: The open mode used when opening the file (w, wb, a, etc.)
+    @param preserve_mode: If True and `filename` exists, preserve `filename`s
+                          current mode instead of applying `mode`.
+    @param ensure_dir_exists: If True (the default), ensure that the directory
+                              containing `filename` exists before writing to
+                              the file.
     """
-    ensure_dir(os.path.dirname(filename))
-    LOG.debug("Writing to %s - %s: [%s] %s bytes",
-               filename, omode, mode, len(content))
+
+    if preserve_mode:
+        try:
+            mode = get_permissions(filename)
+        except OSError:
+            pass
+
+    if ensure_dir_exists:
+        ensure_dir(os.path.dirname(filename))
+    if "b" in omode.lower():
+        content = encode_text(content)
+        write_type = "bytes"
+    else:
+        content = decode_binary(content)
+        write_type = "characters"
+    try:
+        mode_r = "%o" % mode
+    except TypeError:
+        mode_r = "%r" % mode
+    LOG.debug(
+        "Writing to %s - %s: [%s] %s %s",
+        filename,
+        omode,
+        mode_r,
+        len(content),
+        write_type,
+    )
     with SeLinuxGuard(path=filename):
         with open(filename, omode) as fh:
             fh.write(content)
@@ -1514,46 +2125,7 @@ def delete_dir_contents(dirname):
             del_file(node_fullpath)
 
 
-def subp(args, data=None, rcs=None, env=None, capture=True, shell=False,
-         logstring=False):
-    if rcs is None:
-        rcs = [0]
-    try:
-
-        if not logstring:
-            LOG.debug(("Running command %s with allowed return codes %s"
-                       " (shell=%s, capture=%s)"), args, rcs, shell, capture)
-        else:
-            LOG.debug(("Running hidden command to protect sensitive "
-                       "input/output logstring: %s"), logstring)
-
-        if not capture:
-            stdout = None
-            stderr = None
-        else:
-            stdout = subprocess.PIPE
-            stderr = subprocess.PIPE
-        stdin = subprocess.PIPE
-        sp = subprocess.Popen(args, stdout=stdout,
-                        stderr=stderr, stdin=stdin,
-                        env=env, shell=shell)
-        (out, err) = sp.communicate(data)
-    except OSError as e:
-        raise ProcessExecutionError(cmd=args, reason=e)
-    rc = sp.returncode  # pylint: disable=E1101
-    if rc not in rcs:
-        raise ProcessExecutionError(stdout=out, stderr=err,
-                                    exit_code=rc,
-                                    cmd=args)
-    # Just ensure blank instead of none?? (iff capturing)
-    if not out and capture:
-        out = ''
-    if not err and capture:
-        err = ''
-    return (out, err)
-
-
-def make_header(comment_char="#", base='created'):
+def make_header(comment_char="#", base="created"):
     ci_ver = version.version_string()
     header = str(comment_char)
     header += " %s by cloud-init v. %s" % (base.title(), ci_ver)
@@ -1561,8 +2133,8 @@ def make_header(comment_char="#", base='created'):
     return header
 
 
-def abs_join(*paths):
-    return os.path.abspath(os.path.join(*paths))
+def abs_join(base, *paths):
+    return os.path.abspath(os.path.join(base, *paths))
 
 
 # shellify, takes a list of commands
@@ -1570,52 +2142,97 @@ def abs_join(*paths):
 #    if it is an array, shell protect it (with single ticks)
 #    if it is a string, do nothing
 def shellify(cmdlist, add_header=True):
-    content = ''
+    if not isinstance(cmdlist, (tuple, list)):
+        raise TypeError(
+            "Input to shellify was type '%s'. Expected list or tuple."
+            % (type_utils.obj_name(cmdlist))
+        )
+
+    content = ""
     if add_header:
         content += "#!/bin/sh\n"
-    escaped = "%s%s%s%s" % ("'", '\\', "'", "'")
+    escaped = "%s%s%s%s" % ("'", "\\", "'", "'")
     cmds_made = 0
     for args in cmdlist:
         # If the item is a list, wrap all items in single tick.
         # If its not, then just write it directly.
-        if isinstance(args, list):
+        if isinstance(args, (list, tuple)):
             fixed = []
             for f in args:
                 fixed.append("'%s'" % (str(f).replace("'", escaped)))
-            content = "%s%s\n" % (content, ' '.join(fixed))
+            content = "%s%s\n" % (content, " ".join(fixed))
             cmds_made += 1
-        elif isinstance(args, (str, basestring)):
+        elif isinstance(args, str):
             content = "%s%s\n" % (content, args)
             cmds_made += 1
+        # Yaml parsing of a comment results in None
+        elif args is None:
+            pass
         else:
-            raise RuntimeError(("Unable to shellify type %s"
-                                " which is not a list or string")
-                               % (type_utils.obj_name(args)))
+            raise TypeError(
+                "Unable to shellify type '%s'. Expected list, string, tuple. "
+                "Got: %s" % (type_utils.obj_name(args), args)
+            )
+
     LOG.debug("Shellified %s commands.", cmds_made)
     return content
 
 
 def strip_prefix_suffix(line, prefix=None, suffix=None):
     if prefix and line.startswith(prefix):
-        line = line[len(prefix):]
+        line = line[len(prefix) :]
     if suffix and line.endswith(suffix):
-        line = line[:-len(suffix)]
+        line = line[: -len(suffix)]
     return line
 
 
+def _cmd_exits_zero(cmd):
+    if subp.which(cmd[0]) is None:
+        return False
+    try:
+        subp.subp(cmd)
+    except subp.ProcessExecutionError:
+        return False
+    return True
+
+
+def _is_container_systemd():
+    return _cmd_exits_zero(["systemd-detect-virt", "--quiet", "--container"])
+
+
+def _is_container_upstart():
+    return _cmd_exits_zero(["running-in-container"])
+
+
+def _is_container_old_lxc():
+    return _cmd_exits_zero(["lxc-is-container"])
+
+
+def _is_container_freebsd():
+    if not is_FreeBSD():
+        return False
+    cmd = ["sysctl", "-qn", "security.jail.jailed"]
+    if subp.which(cmd[0]) is None:
+        return False
+    out, _ = subp.subp(cmd)
+    return out.strip() == "1"
+
+
+@lru_cache()
 def is_container():
     """
     Checks to see if this code running in a container of some sort
     """
+    checks = (
+        _is_container_systemd,
+        _is_container_freebsd,
+        _is_container_upstart,
+        _is_container_old_lxc,
+    )
 
-    for helper in CONTAINER_TESTS:
-        try:
-            # try to run a helper program. if it returns true/zero
-            # then we're inside a container. otherwise, no
-            subp([helper])
+    for helper in checks:
+        if helper():
             return True
-        except (IOError, OSError):
-            pass
 
     # this code is largely from the logic in
     # ubuntu's /etc/init/container-detect.conf
@@ -1648,24 +2265,38 @@ def is_container():
     return False
 
 
-def get_proc_env(pid):
+def is_lxd():
+    """Check to see if we are running in a lxd container."""
+    return os.path.exists("/dev/lxd/sock")
+
+
+def get_proc_env(pid, encoding="utf-8", errors="replace"):
     """
     Return the environment in a dict that a given process id was started with.
-    """
+
+    @param encoding: if true, then decoding will be done with
+                     .decode(encoding, errors) and text will be returned.
+                     if false then binary will be returned.
+    @param errors:   only used if encoding is true."""
+    fn = os.path.join("/proc", str(pid), "environ")
+
+    try:
+        contents = load_file(fn, decode=False)
+    except (IOError, OSError):
+        return {}
 
     env = {}
-    fn = os.path.join("/proc/", str(pid), "environ")
-    try:
-        contents = load_file(fn)
-        toks = contents.split("\x00")
-        for tok in toks:
-            if tok == "":
-                continue
-            (name, val) = tok.split("=", 1)
-            if name:
-                env[name] = val
-    except (IOError, OSError):
-        pass
+    null, equal = (b"\x00", b"=")
+    if encoding:
+        null, equal = ("\x00", "=")
+        contents = contents.decode(encoding, errors)
+
+    for tok in contents.split(null):
+        if not tok:
+            continue
+        (name, val) = tok.split(equal, 1)
+        if name:
+            env[name] = val
     return env
 
 
@@ -1695,7 +2326,7 @@ def expand_package_list(version_fmt, pkgs):
 
     pkglist = []
     for pkg in pkgs:
-        if isinstance(pkg, basestring):
+        if isinstance(pkg, str):
             pkglist.append(pkg)
             continue
 
@@ -1715,11 +2346,11 @@ def expand_package_list(version_fmt, pkgs):
     return pkglist
 
 
-def parse_mount_info(path, mountinfo_lines, log=LOG):
+def parse_mount_info(path, mountinfo_lines, log=LOG, get_mnt_opts=False):
     """Return the mount information for PATH given the lines from
     /proc/$$/mountinfo."""
 
-    path_elements = [e for e in path.split('/') if e]
+    path_elements = [e for e in path.split("/") if e]
     devpth = None
     fs_type = None
     match_mount_point = None
@@ -1734,36 +2365,39 @@ def parse_mount_info(path, mountinfo_lines, log=LOG):
 
         # The minimum number of elements in a valid line is 10.
         if len(parts) < 10:
-            log.debug("Line %d has two few columns (%d): %s",
-                      i + 1, len(parts), line)
+            log.debug(
+                "Line %d has two few columns (%d): %s", i + 1, len(parts), line
+            )
             return None
 
         mount_point = parts[4]
-        mount_point_elements = [e for e in mount_point.split('/') if e]
+        mount_point_elements = [e for e in mount_point.split("/") if e]
 
         # Ignore mounts deeper than the path in question.
         if len(mount_point_elements) > len(path_elements):
             continue
 
         # Ignore mounts where the common path is not the same.
-        l = min(len(mount_point_elements), len(path_elements))
-        if mount_point_elements[0:l] != path_elements[0:l]:
+        x = min(len(mount_point_elements), len(path_elements))
+        if mount_point_elements[0:x] != path_elements[0:x]:
             continue
 
         # Ignore mount points higher than an already seen mount
         # point.
-        if (match_mount_point_elements is not None and
-            len(match_mount_point_elements) > len(mount_point_elements)):
+        if match_mount_point_elements is not None and len(
+            match_mount_point_elements
+        ) > len(mount_point_elements):
             continue
 
         # Find the '-' which terminates a list of optional columns to
         # find the filesystem type and the path to the device.  See
         # man 5 proc for the format of this file.
         try:
-            i = parts.index('-')
+            i = parts.index("-")
         except ValueError:
-            log.debug("Did not find column named '-' in line %d: %s",
-                      i + 1, line)
+            log.debug(
+                "Did not find column named '-' in line %d: %s", i + 1, line
+            )
             return None
 
         # Get the path to the device.
@@ -1771,17 +2405,23 @@ def parse_mount_info(path, mountinfo_lines, log=LOG):
             fs_type = parts[i + 1]
             devpth = parts[i + 2]
         except IndexError:
-            log.debug("Too few columns after '-' column in line %d: %s",
-                      i + 1, line)
+            log.debug(
+                "Too few columns after '-' column in line %d: %s", i + 1, line
+            )
             return None
 
         match_mount_point = mount_point
         match_mount_point_elements = mount_point_elements
+        mount_options = parts[5]
 
-    if devpth and fs_type and match_mount_point:
-        return (devpth, fs_type, match_mount_point)
+    if get_mnt_opts:
+        if devpth and fs_type and match_mount_point and mount_options:
+            return (devpth, fs_type, match_mount_point, mount_options)
     else:
-        return None
+        if devpth and fs_type and match_mount_point:
+            return (devpth, fs_type, match_mount_point)
+
+    return None
 
 
 def parse_mtab(path):
@@ -1793,20 +2433,122 @@ def parse_mtab(path):
     return None
 
 
+def find_freebsd_part(fs):
+    splitted = fs.split("/")
+    if len(splitted) == 3:
+        return splitted[2]
+    elif splitted[2] in ["label", "gpt", "ufs"]:
+        target_label = fs[5:]
+        (part, _err) = subp.subp(["glabel", "status", "-s"])
+        for labels in part.split("\n"):
+            items = labels.split()
+            if len(items) > 0 and items[0] == target_label:
+                part = items[2]
+                break
+        return str(part)
+    else:
+        LOG.warning("Unexpected input in find_freebsd_part: %s", fs)
+
+
+def find_dragonflybsd_part(fs):
+    splitted = fs.split("/")
+    if len(splitted) == 3 and splitted[1] == "dev":
+        return splitted[2]
+    else:
+        LOG.warning("Unexpected input in find_dragonflybsd_part: %s", fs)
+
+
+def get_path_dev_freebsd(path, mnt_list):
+    path_found = None
+    for line in mnt_list.split("\n"):
+        items = line.split()
+        if len(items) > 2 and os.path.exists(items[1] + path):
+            path_found = line
+            break
+    return path_found
+
+
+def get_mount_info_freebsd(path):
+    (result, err) = subp.subp(["mount", "-p", path], rcs=[0, 1])
+    if len(err):
+        # find a path if the input is not a mounting point
+        (mnt_list, err) = subp.subp(["mount", "-p"])
+        path_found = get_path_dev_freebsd(path, mnt_list)
+        if path_found is None:
+            return None
+        result = path_found
+    ret = result.split()
+    label_part = find_freebsd_part(ret[0])
+    return "/dev/" + label_part, ret[2], ret[1]
+
+
+def get_device_info_from_zpool(zpool):
+    # zpool has 10 second timeout waiting for /dev/zfs LP: #1760173
+    if not os.path.exists("/dev/zfs"):
+        LOG.debug("Cannot get zpool info, no /dev/zfs")
+        return None
+    try:
+        (zpoolstatus, err) = subp.subp(["zpool", "status", zpool])
+    except subp.ProcessExecutionError as err:
+        LOG.warning("Unable to get zpool status of %s: %s", zpool, err)
+        return None
+    if len(err):
+        return None
+    r = r".*(ONLINE).*"
+    for line in zpoolstatus.split("\n"):
+        if re.search(r, line) and zpool not in line and "state" not in line:
+            disk = line.split()[0]
+            LOG.debug('found zpool "%s" on disk %s', zpool, disk)
+            return disk
+
+
 def parse_mount(path):
-    (mountoutput, _err) = subp("mount")
+    (mountoutput, _err) = subp.subp(["mount"])
     mount_locs = mountoutput.splitlines()
+    # there are 2 types of mount outputs we have to parse therefore
+    # the regex is a bit complex. to better understand this regex see:
+    # https://regex101.com/r/2F6c1k/1
+    # https://regex101.com/r/T2en7a/1
+    regex = (
+        r"^(/dev/[\S]+|.*zroot\S*?) on (/[\S]*) "
+        r"(?=(?:type)[\s]+([\S]+)|\(([^,]*))"
+    )
+    if is_DragonFlyBSD():
+        regex = (
+            r"^(/dev/[\S]+|\S*?) on (/[\S]*) "
+            r"(?=(?:type)[\s]+([\S]+)|\(([^,]*))"
+        )
     for line in mount_locs:
-        m = re.search(r'^(/dev/[\S]+) on (/.*) \((.+), .+, (.+)\)$', line)
+        m = re.search(regex, line)
+        if not m:
+            continue
         devpth = m.group(1)
         mount_point = m.group(2)
+        # above regex will either fill the fs_type in group(3)
+        # or group(4) depending on the format we have.
         fs_type = m.group(3)
-        if mount_point == path:
+        if fs_type is None:
+            fs_type = m.group(4)
+        LOG.debug(
+            "found line in mount -> devpth: %s, mount_point: %s, fs_type: %s",
+            devpth,
+            mount_point,
+            fs_type,
+        )
+        # check whether the dev refers to a label on FreeBSD
+        # for example, if dev is '/dev/label/rootfs', we should
+        # continue finding the real device like '/dev/da0'.
+        # this is only valid for non zfs file systems as a zpool
+        # can have gpt labels as disk.
+        devm = re.search("^(/dev/.+)p([0-9])$", devpth)
+        if not devm and is_FreeBSD() and fs_type != "zfs":
+            return get_mount_info_freebsd(path)
+        elif mount_point == path:
             return devpth, fs_type, mount_point
     return None
 
 
-def get_mount_info(path, log=LOG):
+def get_mount_info(path, log=LOG, get_mnt_opts=False):
     # Use /proc/$$/mountinfo to find the device where path is mounted.
     # This is done because with a btrfs filesystem using os.stat(path)
     # does not return the ID of the device.
@@ -1835,33 +2577,14 @@ def get_mount_info(path, log=LOG):
     #
     # So use /proc/$$/mountinfo to find the device underlying the
     # input path.
-    mountinfo_path = '/proc/%s/mountinfo' % os.getpid()
+    mountinfo_path = "/proc/%s/mountinfo" % os.getpid()
     if os.path.exists(mountinfo_path):
         lines = load_file(mountinfo_path).splitlines()
-        return parse_mount_info(path, lines, log)
+        return parse_mount_info(path, lines, log, get_mnt_opts)
     elif os.path.exists("/etc/mtab"):
         return parse_mtab(path)
     else:
         return parse_mount(path)
-
-
-def which(program):
-    # Return path of program for execution if found in path
-    def is_exe(fpath):
-        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
-
-    _fpath, _ = os.path.split(program)
-    if _fpath:
-        if is_exe(program):
-            return program
-    else:
-        for path in os.environ.get("PATH", "").split(os.pathsep):
-            path = path.strip('"')
-            exe_file = os.path.join(path, program)
-            if is_exe(exe_file):
-                return exe_file
-
-    return None
 
 
 def log_time(logfunc, msg, func, args=None, kwargs=None, get_uptime=False):
@@ -1898,7 +2621,7 @@ def log_time(logfunc, msg, func, args=None, kwargs=None, get_uptime=False):
                 tmsg += " (N/A)"
         try:
             logfunc(msg + tmsg)
-        except:
+        except Exception:
             pass
     return ret
 
@@ -1923,14 +2646,270 @@ def pathprefix2dict(base, required=None, optional=None, delim=os.path.sep):
     ret = {}
     for f in required + optional:
         try:
-            ret[f] = load_file(base + delim + f, quiet=False)
+            ret[f] = load_file(base + delim + f, quiet=False, decode=False)
         except IOError as e:
-            if e.errno != errno.ENOENT:
+            if e.errno != ENOENT:
                 raise
             if f in required:
                 missing.append(f)
 
     if len(missing):
-        raise ValueError("Missing required files: %s", ','.join(missing))
+        raise ValueError(
+            "Missing required files: {files}".format(files=",".join(missing))
+        )
 
     return ret
+
+
+def read_meminfo(meminfo="/proc/meminfo", raw=False):
+    # read a /proc/meminfo style file and return
+    # a dict with 'total', 'free', and 'available'
+    mpliers = {"kB": 2 ** 10, "mB": 2 ** 20, "B": 1, "gB": 2 ** 30}
+    kmap = {
+        "MemTotal:": "total",
+        "MemFree:": "free",
+        "MemAvailable:": "available",
+    }
+    ret = {}
+    for line in load_file(meminfo).splitlines():
+        try:
+            key, value, unit = line.split()
+        except ValueError:
+            key, value = line.split()
+            unit = "B"
+        if raw:
+            ret[key] = int(value) * mpliers[unit]
+        elif key in kmap:
+            ret[kmap[key]] = int(value) * mpliers[unit]
+
+    return ret
+
+
+def human2bytes(size):
+    """Convert human string or integer to size in bytes
+    10M => 10485760
+    .5G => 536870912
+    """
+    size_in = size
+    if size.endswith("B"):
+        size = size[:-1]
+
+    mpliers = {"B": 1, "K": 2 ** 10, "M": 2 ** 20, "G": 2 ** 30, "T": 2 ** 40}
+
+    num = size
+    mplier = "B"
+    for m in mpliers:
+        if size.endswith(m):
+            mplier = m
+            num = size[0 : -len(m)]
+
+    try:
+        num = float(num)
+    except ValueError as e:
+        raise ValueError("'%s' is not valid input." % size_in) from e
+
+    if num < 0:
+        raise ValueError("'%s': cannot be negative" % size_in)
+
+    return int(num * mpliers[mplier])
+
+
+def is_x86(uname_arch=None):
+    """Return True if platform is x86-based"""
+    if uname_arch is None:
+        uname_arch = os.uname()[4]
+    x86_arch_match = uname_arch == "x86_64" or (
+        uname_arch[0] == "i" and uname_arch[2:] == "86"
+    )
+    return x86_arch_match
+
+
+def message_from_string(string):
+    if sys.version_info[:2] < (2, 7):
+        return email.message_from_file(io.StringIO(string))
+    return email.message_from_string(string)
+
+
+def get_installed_packages(target=None):
+    (out, _) = subp.subp(["dpkg-query", "--list"], target=target, capture=True)
+
+    pkgs_inst = set()
+    for line in out.splitlines():
+        try:
+            (state, pkg, _) = line.split(None, 2)
+        except ValueError:
+            continue
+        if state.startswith("hi") or state.startswith("ii"):
+            pkgs_inst.add(re.sub(":.*", "", pkg))
+
+    return pkgs_inst
+
+
+def system_is_snappy():
+    # channel.ini is configparser loadable.
+    # snappy will move to using /etc/system-image/config.d/*.ini
+    # this is certainly not a perfect test, but good enough for now.
+    orpath = "/etc/os-release"
+    try:
+        orinfo = load_shell_content(load_file(orpath, quiet=True))
+        if orinfo.get("ID", "").lower() == "ubuntu-core":
+            return True
+    except ValueError as e:
+        LOG.warning("Unexpected error loading '%s': %s", orpath, e)
+
+    cmdline = get_cmdline()
+    if "snap_core=" in cmdline:
+        return True
+
+    content = load_file("/etc/system-image/channel.ini", quiet=True)
+    if "ubuntu-core" in content.lower():
+        return True
+    if os.path.isdir("/etc/system-image/config.d/"):
+        return True
+    return False
+
+
+def indent(text, prefix):
+    """replacement for indent from textwrap that is not available in 2.7."""
+    lines = []
+    for line in text.splitlines(True):
+        lines.append(prefix + line)
+    return "".join(lines)
+
+
+def rootdev_from_cmdline(cmdline):
+    found = None
+    for tok in cmdline.split():
+        if tok.startswith("root="):
+            found = tok[5:]
+            break
+    if found is None:
+        return None
+
+    if found.startswith("/dev/"):
+        return found
+    if found.startswith("LABEL="):
+        return "/dev/disk/by-label/" + found[len("LABEL=") :]
+    if found.startswith("UUID="):
+        return "/dev/disk/by-uuid/" + found[len("UUID=") :].lower()
+    if found.startswith("PARTUUID="):
+        disks_path = (
+            "/dev/disk/by-partuuid/" + found[len("PARTUUID=") :].lower()
+        )
+        if os.path.exists(disks_path):
+            return disks_path
+        results = find_devs_with(found)
+        if results:
+            return results[0]
+        # we know this doesn't exist, but for consistency return the path as
+        # it /would/ exist
+        return disks_path
+
+    return "/dev/" + found
+
+
+def load_shell_content(content, add_empty=False, empty_val=None):
+    """Given shell like syntax (key=value\nkey2=value2\n) in content
+    return the data in dictionary form.  If 'add_empty' is True
+    then add entries in to the returned dictionary for 'VAR='
+    variables.  Set their value to empty_val."""
+
+    def _shlex_split(blob):
+        return shlex.split(blob, comments=True)
+
+    data = {}
+    for line in _shlex_split(content):
+        key, value = line.split("=", 1)
+        if not value:
+            value = empty_val
+        if add_empty or value:
+            data[key] = value
+
+    return data
+
+
+def wait_for_files(flist, maxwait, naplen=0.5, log_pre=""):
+    need = set(flist)
+    waited = 0
+    while True:
+        need -= set([f for f in need if os.path.exists(f)])
+        if len(need) == 0:
+            LOG.debug(
+                "%sAll files appeared after %s seconds: %s",
+                log_pre,
+                waited,
+                flist,
+            )
+            return []
+        if waited == 0:
+            LOG.debug(
+                "%sWaiting up to %s seconds for the following files: %s",
+                log_pre,
+                maxwait,
+                flist,
+            )
+        if waited + naplen > maxwait:
+            break
+        time.sleep(naplen)
+        waited += naplen
+
+    LOG.debug(
+        "%sStill missing files after %s seconds: %s", log_pre, maxwait, need
+    )
+    return need
+
+
+def mount_is_read_write(mount_point):
+    """Check whether the given mount point is mounted rw"""
+    result = get_mount_info(mount_point, get_mnt_opts=True)
+    mount_opts = result[-1].split(",")
+    return mount_opts[0] == "rw"
+
+
+def udevadm_settle(exists=None, timeout=None):
+    """Invoke udevadm settle with optional exists and timeout parameters"""
+    settle_cmd = ["udevadm", "settle"]
+    if exists:
+        # skip the settle if the requested path already exists
+        if os.path.exists(exists):
+            return
+        settle_cmd.extend(["--exit-if-exists=%s" % exists])
+    if timeout:
+        settle_cmd.extend(["--timeout=%s" % timeout])
+
+    return subp.subp(settle_cmd)
+
+
+def get_proc_ppid(pid):
+    """
+    Return the parent pid of a process.
+    """
+    ppid = 0
+    try:
+        contents = load_file("/proc/%s/stat" % pid, quiet=True)
+    except IOError as e:
+        LOG.warning("Failed to load /proc/%s/stat. %s", pid, e)
+    if contents:
+        parts = contents.split(" ", 4)
+        # man proc says
+        #  ppid %d     (4) The PID of the parent.
+        ppid = int(parts[3])
+    return ppid
+
+
+def error(msg, rc=1, fmt="Error:\n{}", sys_exit=False):
+    """
+    Print error to stderr and return or exit
+
+    @param msg: message to print
+    @param rc: return code (default: 1)
+    @param fmt: format string for putting message in (default: 'Error:\n {}')
+    @param sys_exit: exit when called (default: false)
+    """
+    print(fmt.format(msg), file=sys.stderr)
+    if sys_exit:
+        sys.exit(rc)
+    return rc
+
+
+# vi: ts=4 expandtab

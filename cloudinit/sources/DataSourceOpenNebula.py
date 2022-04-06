@@ -1,84 +1,81 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Canonical Ltd.
+# Copyright (C) 2012 Yahoo! Inc.
+# Copyright (C) 2012-2013 CERIT Scientific Cloud
+# Copyright (C) 2012-2013 OpenNebula.org
+# Copyright (C) 2014 Consejo Superior de Investigaciones Cientificas
 #
-#    Copyright (C) 2012 Canonical Ltd.
-#    Copyright (C) 2012 Yahoo! Inc.
-#    Copyright (C) 2012-2013 CERIT Scientific Cloud
-#    Copyright (C) 2012-2013 OpenNebula.org
-#    Copyright (C) 2014 Consejo Superior de Investigaciones Cientificas
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
+# Author: Vlastimil Holer <xholer@mail.muni.cz>
+# Author: Javier Fontan <jfontan@opennebula.org>
+# Author: Enol Fernandez <enolfc@ifca.unican.es>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#    Author: Vlastimil Holer <xholer@mail.muni.cz>
-#    Author: Javier Fontan <jfontan@opennebula.org>
-#    Author: Enol Fernandez <enolfc@ifca.unican.es>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
-import base64
+import collections
+import functools
 import os
 import pwd
 import re
-import string  # pylint: disable=W0402
+import string
 
 from cloudinit import log as logging
-from cloudinit import sources
-from cloudinit import util
+from cloudinit import net, sources, subp, util
 
 LOG = logging.getLogger(__name__)
 
 DEFAULT_IID = "iid-dsopennebula"
-DEFAULT_MODE = 'net'
-DEFAULT_PARSEUSER = 'nobody'
+DEFAULT_PARSEUSER = "nobody"
 CONTEXT_DISK_FILES = ["context.sh"]
-VALID_DSMODES = ("local", "net", "disabled")
 
 
 class DataSourceOpenNebula(sources.DataSource):
+
+    dsname = "OpenNebula"
+
     def __init__(self, sys_cfg, distro, paths):
         sources.DataSource.__init__(self, sys_cfg, distro, paths)
-        self.dsmode = 'local'
         self.seed = None
-        self.seed_dir = os.path.join(paths.seed_dir, 'opennebula')
+        self.seed_dir = os.path.join(paths.seed_dir, "opennebula")
 
     def __str__(self):
         root = sources.DataSource.__str__(self)
         return "%s [seed=%s][dsmode=%s]" % (root, self.seed, self.dsmode)
 
-    def get_data(self):
+    def _get_data(self):
         defaults = {"instance-id": DEFAULT_IID}
         results = None
         seed = None
 
         # decide parseuser for context.sh shell reader
         parseuser = DEFAULT_PARSEUSER
-        if 'parseuser' in self.ds_cfg:
-            parseuser = self.ds_cfg.get('parseuser')
+        if "parseuser" in self.ds_cfg:
+            parseuser = self.ds_cfg.get("parseuser")
 
         candidates = [self.seed_dir]
         candidates.extend(find_candidate_devs())
         for cdev in candidates:
             try:
                 if os.path.isdir(self.seed_dir):
-                    results = read_context_disk_dir(cdev, asuser=parseuser)
+                    results = read_context_disk_dir(
+                        cdev, self.distro, asuser=parseuser
+                    )
                 elif cdev.startswith("/dev"):
-                    results = util.mount_cb(cdev, read_context_disk_dir,
-                                            data=parseuser)
+                    # util.mount_cb only handles passing a single argument
+                    # through to the wrapped function, so we have to partially
+                    # apply the function to pass in `distro`.  See LP: #1884979
+                    partially_applied_func = functools.partial(
+                        read_context_disk_dir,
+                        asuser=parseuser,
+                        distro=self.distro,
+                    )
+                    results = util.mount_cb(cdev, partially_applied_func)
             except NonContextDiskDir:
                 continue
             except BrokenContextDiskDir as exc:
                 raise exc
             except util.MountFailedError:
-                LOG.warn("%s was not mountable" % cdev)
+                LOG.warning("%s was not mountable", cdev)
 
             if results:
                 seed = cdev
@@ -89,54 +86,45 @@ class DataSourceOpenNebula(sources.DataSource):
             return False
 
         # merge fetched metadata with datasource defaults
-        md = results['metadata']
+        md = results["metadata"]
         md = util.mergemanydict([md, defaults])
 
         # check for valid user specified dsmode
-        user_dsmode = results['metadata'].get('DSMODE', None)
-        if user_dsmode not in VALID_DSMODES + (None,):
-            LOG.warn("user specified invalid mode: %s", user_dsmode)
-            user_dsmode = None
+        self.dsmode = self._determine_dsmode(
+            [results.get("DSMODE"), self.ds_cfg.get("dsmode")]
+        )
 
-        # decide dsmode
-        if user_dsmode:
-            dsmode = user_dsmode
-        elif self.ds_cfg.get('dsmode'):
-            dsmode = self.ds_cfg.get('dsmode')
-        else:
-            dsmode = DEFAULT_MODE
-
-        if dsmode == "disabled":
-            # most likely user specified
-            return False
-
-        # apply static network configuration only in 'local' dsmode
-        if ('network-interfaces' in results and self.dsmode == "local"):
-            LOG.debug("Updating network interfaces from %s", self)
-            self.distro.apply_network(results['network-interfaces'])
-
-        if dsmode != self.dsmode:
-            LOG.debug("%s: not claiming datasource, dsmode=%s", self, dsmode)
+        if self.dsmode == sources.DSMODE_DISABLED:
             return False
 
         self.seed = seed
+        self.network = results.get("network-interfaces")
         self.metadata = md
-        self.userdata_raw = results.get('userdata')
+        self.userdata_raw = results.get("userdata")
         return True
 
-    def get_hostname(self, fqdn=False, resolve_ip=None):
+    def _get_subplatform(self):
+        """Return the subplatform metadata source details."""
+        if self.seed_dir in self.seed:
+            subplatform_type = "seed-dir"
+        else:
+            subplatform_type = "config-disk"
+        return "%s (%s)" % (subplatform_type, self.seed)
+
+    @property
+    def network_config(self):
+        if self.network is not None:
+            return self.network
+        else:
+            return None
+
+    def get_hostname(self, fqdn=False, resolve_ip=False, metadata_only=False):
         if resolve_ip is None:
-            if self.dsmode == 'net':
+            if self.dsmode == sources.DSMODE_NETWORK:
                 resolve_ip = True
             else:
                 resolve_ip = False
         return sources.DataSource.get_hostname(self, fqdn, resolve_ip)
-
-
-class DataSourceOpenNebulaNet(DataSourceOpenNebula):
-    def __init__(self, sys_cfg, distro, paths):
-        DataSourceOpenNebula.__init__(self, sys_cfg, distro, paths)
-        self.dsmode = 'net'
 
 
 class NonContextDiskDir(Exception):
@@ -148,104 +136,153 @@ class BrokenContextDiskDir(Exception):
 
 
 class OpenNebulaNetwork(object):
-    REG_DEV_MAC = re.compile(
-                    r'^\d+: (eth\d+):.*?link\/ether (..:..:..:..:..:..) ?',
-                    re.MULTILINE | re.DOTALL)
-
-    def __init__(self, ip, context):
-        self.ip = ip
+    def __init__(self, context, distro, system_nics_by_mac=None):
         self.context = context
-        self.ifaces = self.get_ifaces()
+        if system_nics_by_mac is None:
+            system_nics_by_mac = get_physical_nics_by_mac(distro)
+        self.ifaces = collections.OrderedDict(
+            [
+                k
+                for k in sorted(
+                    system_nics_by_mac.items(),
+                    key=lambda k: net.natural_sort_key(k[1]),
+                )
+            ]
+        )
 
-    def get_ifaces(self):
-        return self.REG_DEV_MAC.findall(self.ip)
+        # OpenNebula 4.14+ provide macaddr for ETHX in variable ETH_MAC.
+        # context_devname provides {mac.lower():ETHX, mac2.lower():ETHX}
+        self.context_devname = {}
+        for k, v in context.items():
+            m = re.match(r"^(.+)_MAC$", k)
+            if m:
+                self.context_devname[v.lower()] = m.group(1)
 
     def mac2ip(self, mac):
-        components = mac.split(':')[2:]
-        return [str(int(c, 16)) for c in components]
+        return ".".join([str(int(c, 16)) for c in mac.split(":")[2:]])
 
-    def get_ip(self, dev, components):
-        var_name = dev.upper() + '_IP'
-        if var_name in self.context:
-            return self.context[var_name]
-        else:
-            return '.'.join(components)
+    def mac2network(self, mac):
+        return self.mac2ip(mac).rpartition(".")[0] + ".0"
 
-    def get_mask(self, dev):
-        var_name = dev.upper() + '_MASK'
-        if var_name in self.context:
-            return self.context[var_name]
-        else:
-            return '255.255.255.0'
+    def get_nameservers(self, dev):
+        nameservers = {}
+        dns = self.get_field(dev, "dns", "").split()
+        dns.extend(self.context.get("DNS", "").split())
+        if dns:
+            nameservers["addresses"] = dns
+        search_domain = self.get_field(dev, "search_domain", "").split()
+        if search_domain:
+            nameservers["search"] = search_domain
+        return nameservers
 
-    def get_network(self, dev, components):
-        var_name = dev.upper() + '_NETWORK'
-        if var_name in self.context:
-            return self.context[var_name]
-        else:
-            return '.'.join(components[:-1]) + '.0'
+    def get_mtu(self, dev):
+        return self.get_field(dev, "mtu")
+
+    def get_ip(self, dev, mac):
+        return self.get_field(dev, "ip", self.mac2ip(mac))
+
+    def get_ip6(self, dev):
+        addresses6 = []
+        ip6 = self.get_field(dev, "ip6")
+        if ip6:
+            addresses6.append(ip6)
+        ip6_ula = self.get_field(dev, "ip6_ula")
+        if ip6_ula:
+            addresses6.append(ip6_ula)
+        return addresses6
+
+    def get_ip6_prefix(self, dev):
+        return self.get_field(dev, "ip6_prefix_length", "64")
 
     def get_gateway(self, dev):
-        var_name = dev.upper() + '_GATEWAY'
-        if var_name in self.context:
-            return self.context[var_name]
-        else:
-            return None
+        return self.get_field(dev, "gateway")
 
-    def get_dns(self, dev):
-        var_name = dev.upper() + '_DNS'
-        if var_name in self.context:
-            return self.context[var_name]
-        else:
-            return None
+    def get_gateway6(self, dev):
+        # OpenNebula 6.1.80 introduced new context parameter ETHx_IP6_GATEWAY
+        # to replace old ETHx_GATEWAY6. Old ETHx_GATEWAY6 will be removed in
+        # OpenNebula 6.4.0 (https://github.com/OpenNebula/one/issues/5536).
+        return self.get_field(
+            dev, "ip6_gateway", self.get_field(dev, "gateway6")
+        )
 
-    def get_domain(self, dev):
-        var_name = dev.upper() + '_DOMAIN'
-        if var_name in self.context:
-            return self.context[var_name]
-        else:
-            return None
+    def get_mask(self, dev):
+        return self.get_field(dev, "mask", "255.255.255.0")
+
+    def get_network(self, dev, mac):
+        return self.get_field(dev, "network", self.mac2network(mac))
+
+    def get_field(self, dev, name, default=None):
+        """return the field name in context for device dev.
+
+        context stores <dev>_<NAME> (example: eth0_DOMAIN).
+        an empty string for value will return default."""
+        val = self.context.get(
+            "_".join(
+                (
+                    dev,
+                    name,
+                )
+            ).upper()
+        )
+        # allow empty string to return the default.
+        return default if val in (None, "") else val
 
     def gen_conf(self):
-        global_dns = []
-        if 'DNS' in self.context:
-            global_dns.append(self.context['DNS'])
+        netconf = {}
+        netconf["version"] = 2
+        netconf["ethernets"] = {}
 
-        conf = []
-        conf.append('auto lo')
-        conf.append('iface lo inet loopback')
-        conf.append('')
+        ethernets = {}
+        for mac, dev in self.ifaces.items():
+            mac = mac.lower()
 
-        for i in self.ifaces:
-            dev = i[0]
-            mac = i[1]
-            ip_components = self.mac2ip(mac)
+            # c_dev stores name in context 'ETHX' for this device.
+            # dev stores the current system name.
+            c_dev = self.context_devname.get(mac, dev)
 
-            conf.append('auto ' + dev)
-            conf.append('iface ' + dev + ' inet static')
-            conf.append('  address ' + self.get_ip(dev, ip_components))
-            conf.append('  network ' + self.get_network(dev, ip_components))
-            conf.append('  netmask ' + self.get_mask(dev))
+            devconf = {}
 
-            gateway = self.get_gateway(dev)
+            # Set MAC address
+            devconf["match"] = {"macaddress": mac}
+
+            # Set IPv4 address
+            devconf["addresses"] = []
+            mask = self.get_mask(c_dev)
+            prefix = str(net.ipv4_mask_to_net_prefix(mask))
+            devconf["addresses"].append(self.get_ip(c_dev, mac) + "/" + prefix)
+
+            # Set IPv6 Global and ULA address
+            addresses6 = self.get_ip6(c_dev)
+            if addresses6:
+                prefix6 = self.get_ip6_prefix(c_dev)
+                devconf["addresses"].extend(
+                    [i + "/" + prefix6 for i in addresses6]
+                )
+
+            # Set IPv4 default gateway
+            gateway = self.get_gateway(c_dev)
             if gateway:
-                conf.append('  gateway ' + gateway)
+                devconf["gateway4"] = gateway
 
-            domain = self.get_domain(dev)
-            if domain:
-                conf.append('  dns-search ' + domain)
+            # Set IPv6 default gateway
+            gateway6 = self.get_gateway6(c_dev)
+            if gateway6:
+                devconf["gateway6"] = gateway6
 
-            # add global DNS servers to all interfaces
-            dns = self.get_dns(dev)
-            if global_dns or dns:
-                all_dns = global_dns
-                if dns:
-                    all_dns.append(dns)
-                conf.append('  dns-nameservers ' + ' '.join(all_dns))
+            # Set DNS servers and search domains
+            nameservers = self.get_nameservers(c_dev)
+            if nameservers:
+                devconf["nameservers"] = nameservers
 
-            conf.append('')
+            # Set MTU size
+            mtu = self.get_mtu(c_dev)
+            if mtu:
+                devconf["mtu"] = mtu
 
-        return "\n".join(conf)
+            ethernets[dev] = devconf
+
+        netconf["ethernets"] = ethernets
+        return netconf
 
 
 def find_candidate_devs():
@@ -253,7 +290,7 @@ def find_candidate_devs():
     Return a list of devices that may contain the context disk.
     """
     combined = []
-    for f in ('LABEL=CONTEXT', 'LABEL=CDROM', 'TYPE=iso9660'):
+    for f in ("LABEL=CONTEXT", "LABEL=CDROM", "TYPE=iso9660"):
         devs = util.find_devs_with(f)
         devs.sort()
         for d in devs:
@@ -264,40 +301,48 @@ def find_candidate_devs():
 
 
 def switch_user_cmd(user):
-    return ['sudo', '-u', user]
+    return ["sudo", "-u", user]
 
 
-def parse_shell_config(content, keylist=None, bash=None, asuser=None,
-                       switch_user_cb=None):
+def parse_shell_config(
+    content, keylist=None, bash=None, asuser=None, switch_user_cb=None
+):
 
     if isinstance(bash, str):
         bash = [bash]
     elif bash is None:
-        bash = ['bash', '-e']
+        bash = ["bash", "-e"]
 
     if switch_user_cb is None:
         switch_user_cb = switch_user_cmd
 
     # allvars expands to all existing variables by using '${!x*}' notation
     # where x is lower or upper case letters or '_'
-    allvars = ["${!%s*}" % x for x in string.letters + "_"]
+    allvars = ["${!%s*}" % x for x in string.ascii_letters + "_"]
 
     keylist_in = keylist
     if keylist is None:
         keylist = allvars
         keylist_in = []
 
-    setup = '\n'.join(('__v="";', '',))
+    setup = "\n".join(
+        (
+            '__v="";',
+            "",
+        )
+    )
 
     def varprinter(vlist):
         # output '\0'.join(['_start_', key=value NULL for vars in vlist]
-        return '\n'.join((
-            'printf "%s\\0" _start_',
-            'for __v in %s; do' % ' '.join(vlist),
-            '   printf "%s=%s\\0" "$__v" "${!__v}";',
-            'done',
-            ''
-        ))
+        return "\n".join(
+            (
+                'printf "%s\\0" _start_',
+                "for __v in %s; do" % " ".join(vlist),
+                '   printf "%s=%s\\0" "$__v" "${!__v}";',
+                "done",
+                "",
+            )
+        )
 
     # the rendered 'bcmd' is bash syntax that does
     # setup: declare variables we use (so they show up in 'all')
@@ -310,12 +355,15 @@ def parse_shell_config(content, keylist=None, bash=None, asuser=None,
     #   key=value (for each preset variable)
     #   literal '_start_'
     #   key=value (for each post set variable)
-    bcmd = ('unset IFS\n' +
-            setup +
-            varprinter(allvars) +
-            '{\n%s\n\n:\n} > /dev/null\n' % content +
-            'unset IFS\n' +
-            varprinter(keylist) + "\n")
+    bcmd = (
+        "unset IFS\n"
+        + setup
+        + varprinter(allvars)
+        + "{\n%s\n\n:\n} > /dev/null\n" % content
+        + "unset IFS\n"
+        + varprinter(keylist)
+        + "\n"
+    )
 
     cmd = []
     if asuser is not None:
@@ -323,24 +371,34 @@ def parse_shell_config(content, keylist=None, bash=None, asuser=None,
 
     cmd.extend(bash)
 
-    (output, _error) = util.subp(cmd, data=bcmd)
+    (output, _error) = subp.subp(cmd, data=bcmd)
 
     # exclude vars in bash that change on their own or that we used
-    excluded = ("RANDOM", "LINENO", "SECONDS", "_", "__v")
+    excluded = (
+        "EPOCHREALTIME",
+        "EPOCHSECONDS",
+        "RANDOM",
+        "LINENO",
+        "SECONDS",
+        "_",
+        "SRANDOM",
+        "__v",
+    )
     preset = {}
     ret = {}
     target = None
     output = output[0:-1]  # remove trailing null
 
     # go through output.  First _start_ is for 'preset', second for 'target'.
-    # Add to target only things were changed and not in volitile
+    # Add to ret only things were changed and not in excluded.
     for line in output.split("\x00"):
         try:
             (key, val) = line.split("=", 1)
             if target is preset:
-                target[key] = val
-            elif (key not in excluded and
-                  (key in keylist_in or preset.get(key) != val)):
+                preset[key] = val
+            elif key not in excluded and (
+                key in keylist_in or preset.get(key) != val
+            ):
                 ret[key] = val
         except ValueError:
             if line != "_start_":
@@ -353,7 +411,7 @@ def parse_shell_config(content, keylist=None, bash=None, asuser=None,
     return ret
 
 
-def read_context_disk_dir(source_dir, asuser=None):
+def read_context_disk_dir(source_dir, distro, asuser=None):
     """
     read_context_disk_dir(source_dir):
     read source_dir and return a tuple with metadata dict and user-data
@@ -369,31 +427,37 @@ def read_context_disk_dir(source_dir, asuser=None):
         raise NonContextDiskDir("%s: %s" % (source_dir, "no files found"))
 
     context = {}
-    results = {'userdata': None, 'metadata': {}}
+    results = {"userdata": None, "metadata": {}}
 
     if "context.sh" in found:
         if asuser is not None:
             try:
                 pwd.getpwnam(asuser)
             except KeyError as e:
-                raise BrokenContextDiskDir("configured user '%s' "
-                                           "does not exist", asuser)
+                raise BrokenContextDiskDir(
+                    "configured user '{user}' does not exist".format(
+                        user=asuser
+                    )
+                ) from e
         try:
-            with open(os.path.join(source_dir, 'context.sh'), 'r') as f:
-                content = f.read().strip()
-
+            path = os.path.join(source_dir, "context.sh")
+            content = util.load_file(path)
             context = parse_shell_config(content, asuser=asuser)
-        except util.ProcessExecutionError as e:
-            raise BrokenContextDiskDir("Error processing context.sh: %s" % (e))
+        except subp.ProcessExecutionError as e:
+            raise BrokenContextDiskDir(
+                "Error processing context.sh: %s" % (e)
+            ) from e
         except IOError as e:
-            raise NonContextDiskDir("Error reading context.sh: %s" % (e))
+            raise NonContextDiskDir(
+                "Error reading context.sh: %s" % (e)
+            ) from e
     else:
         raise NonContextDiskDir("Missing context.sh")
 
     if not context:
         return results
 
-    results['metadata'] = context
+    results["metadata"] = context
 
     # process single or multiple SSH keys
     ssh_key_var = None
@@ -404,52 +468,64 @@ def read_context_disk_dir(source_dir, asuser=None):
 
     if ssh_key_var:
         lines = context.get(ssh_key_var).splitlines()
-        results['metadata']['public-keys'] = [l for l in lines
-            if len(l) and not l.startswith("#")]
+        results["metadata"]["public-keys"] = [
+            line for line in lines if len(line) and not line.startswith("#")
+        ]
 
     # custom hostname -- try hostname or leave cloud-init
     # itself create hostname from IP address later
-    for k in ('HOSTNAME', 'PUBLIC_IP', 'IP_PUBLIC', 'ETH0_IP'):
+    for k in ("SET_HOSTNAME", "HOSTNAME", "PUBLIC_IP", "IP_PUBLIC", "ETH0_IP"):
         if k in context:
-            results['metadata']['local-hostname'] = context[k]
+            results["metadata"]["local-hostname"] = context[k]
             break
 
     # raw user data
     if "USER_DATA" in context:
-        results['userdata'] = context["USER_DATA"]
+        results["userdata"] = context["USER_DATA"]
     elif "USERDATA" in context:
-        results['userdata'] = context["USERDATA"]
+        results["userdata"] = context["USERDATA"]
 
     # b64decode user data if necessary (default)
-    if 'userdata' in results:
-        encoding = context.get('USERDATA_ENCODING',
-                               context.get('USER_DATA_ENCODING'))
+    if "userdata" in results:
+        encoding = context.get(
+            "USERDATA_ENCODING", context.get("USER_DATA_ENCODING")
+        )
         if encoding == "base64":
             try:
-                results['userdata'] = base64.b64decode(results['userdata'])
+                results["userdata"] = util.b64d(results["userdata"])
             except TypeError:
-                LOG.warn("Failed base64 decoding of userdata")
+                LOG.warning("Failed base64 decoding of userdata")
 
-    # generate static /etc/network/interfaces
+    # generate Network Configuration v2
     # only if there are any required context variables
-    # http://opennebula.org/documentation:rel3.8:cong#network_configuration
-    for k in context.keys():
-        if re.match(r'^ETH\d+_IP$', k):
-            (out, _) = util.subp(['/sbin/ip', 'link'])
-            net = OpenNebulaNetwork(out, context)
-            results['network-interfaces'] = net.gen_conf()
-            break
+    # http://docs.opennebula.org/5.4/operation/references/template.html#context-section
+    ipaddr_keys = [k for k in context if re.match(r"^ETH\d+_IP.*$", k)]
+    if ipaddr_keys:
+        onet = OpenNebulaNetwork(context, distro)
+        results["network-interfaces"] = onet.gen_conf()
 
     return results
 
 
+def get_physical_nics_by_mac(distro):
+    devs = net.get_interfaces_by_mac()
+    return dict(
+        [(m, n) for m, n in devs.items() if distro.networking.is_physical(n)]
+    )
+
+
+# Legacy: Must be present in case we load an old pkl object
+DataSourceOpenNebulaNet = DataSourceOpenNebula
+
 # Used to match classes to dependencies
 datasources = [
-    (DataSourceOpenNebula, (sources.DEP_FILESYSTEM, )),
-    (DataSourceOpenNebulaNet, (sources.DEP_FILESYSTEM, sources.DEP_NETWORK)),
+    (DataSourceOpenNebula, (sources.DEP_FILESYSTEM,)),
 ]
 
 
 # Return a list of data sources that match this set of dependencies
 def get_datasource_list(depends):
     return sources.list_from_depends(depends, datasources)
+
+
+# vi: ts=4 expandtab

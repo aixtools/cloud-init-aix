@@ -1,22 +1,68 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2011 Canonical Ltd.
+# Copyright (C) 2013 Hewlett-Packard Development Company, L.P.
 #
-#    Copyright (C) 2011 Canonical Ltd.
-#    Copyright (C) 2013 Hewlett-Packard Development Company, L.P.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
+
+"""
+Growpart
+--------
+**Summary:** grow partitions
+
+Growpart resizes partitions to fill the available disk space.
+This is useful for cloud instances with a larger amount of disk space available
+than the pristine image uses, as it allows the instance to automatically make
+use of the extra space.
+
+The devices on which to run growpart are specified as a list under the
+``devices`` key. Each entry in the devices list can be either the path to the
+device's mountpoint in the filesystem or a path to the block device in
+``/dev``.
+
+The utility to use for resizing can be selected using the ``mode`` config key.
+If the ``mode`` key is set to ``auto``, then any available utility (either
+``growpart`` or BSD ``gpart``) will be used. If neither utility is available,
+no error will be raised. If ``mode`` is set to ``growpart``, then the
+``growpart`` utility will be used. If this utility is not available on the
+system, this will result in an error. If ``mode`` is set to ``off`` or
+``false``, then ``cc_growpart`` will take no action.
+
+There is some functionality overlap between this module and the ``growroot``
+functionality of ``cloud-initramfs-tools``. However, there are some situations
+where one tool is able to function and the other is not. The default
+configuration for both should work for most cloud instances. To explicitly
+prevent ``cloud-initramfs-tools`` from running ``growroot``, the file
+``/etc/growroot-disabled`` can be created. By default, both ``growroot`` and
+``cc_growpart`` will check for the existence of this file and will not run if
+it is present. However, this file can be ignored for ``cc_growpart`` by setting
+``ignore_growroot_disabled`` to ``true``. For more information on
+``cloud-initramfs-tools`` see: https://launchpad.net/cloud-initramfs-tools
+
+Growpart is enabled by default on the root partition. The default config for
+growpart is::
+
+    growpart:
+        mode: auto
+        devices: ["/"]
+        ignore_growroot_disabled: false
+
+**Internal name:** ``cc_growpart``
+
+**Module frequency:** always
+
+**Supported distros:** all
+
+**Config keys**::
+
+    growpart:
+        mode: <auto/growpart/off/false>
+        devices:
+            - "/"
+            - "/dev/vdb1"
+        ignore_growroot_disabled: <true/false>
+"""
 
 import os
 import os.path
@@ -24,24 +70,24 @@ import re
 import stat
 
 from cloudinit import log as logging
+from cloudinit import subp, temp_utils, util
 from cloudinit.settings import PER_ALWAYS
-from cloudinit import util
 
 frequency = PER_ALWAYS
 
 DEFAULT_CONFIG = {
-    'mode': 'auto',
-    'devices': ['/'],
-    'ignore_growroot_disabled': False,
+    "mode": "auto",
+    "devices": ["/"],
+    "ignore_growroot_disabled": False,
 }
 
 
-def enum(**enums):
-    return type('Enum', (), enums)
+class RESIZE(object):
+    SKIPPED = "SKIPPED"
+    CHANGED = "CHANGED"
+    NOCHANGE = "NOCHANGE"
+    FAILED = "FAILED"
 
-
-RESIZE = enum(SKIPPED="SKIPPED", CHANGED="CHANGED", NOCHANGE="NOCHANGE",
-              FAILED="FAILED")
 
 LOG = logging.getLogger(__name__)
 
@@ -83,42 +129,66 @@ class ResizeFailedException(Exception):
 class ResizeGrowPart(object):
     def available(self):
         myenv = os.environ.copy()
-        myenv['LANG'] = 'C'
+        myenv["LANG"] = "C"
 
         try:
-            (out, _err) = util.subp(["growpart", "--help"], env=myenv)
-            if re.search(r"--update\s+", out, re.DOTALL):
+            (out, _err) = subp.subp(["growpart", "--help"], env=myenv)
+            if re.search(r"--update\s+", out):
                 return True
 
-        except util.ProcessExecutionError:
+        except subp.ProcessExecutionError:
             pass
         return False
 
     def resize(self, diskdev, partnum, partdev):
+        myenv = os.environ.copy()
+        myenv["LANG"] = "C"
         before = get_size(partdev)
-        try:
-            util.subp(["growpart", '--dry-run', diskdev, partnum])
-        except util.ProcessExecutionError as e:
-            if e.exit_code != 1:
-                util.logexc(LOG, "Failed growpart --dry-run for (%s, %s)",
-                            diskdev, partnum)
-                raise ResizeFailedException(e)
-            return (before, before)
 
-        try:
-            util.subp(["growpart", diskdev, partnum])
-        except util.ProcessExecutionError as e:
-            util.logexc(LOG, "Failed: growpart %s %s", diskdev, partnum)
-            raise ResizeFailedException(e)
+        # growpart uses tmp dir to store intermediate states
+        # and may conflict with systemd-tmpfiles-clean
+        with temp_utils.tempdir(needs_exe=True) as tmpd:
+            growpart_tmp = os.path.join(tmpd, "growpart")
+            if not os.path.exists(growpart_tmp):
+                os.mkdir(growpart_tmp, 0o700)
+            myenv["TMPDIR"] = growpart_tmp
+            try:
+                subp.subp(
+                    ["growpart", "--dry-run", diskdev, partnum], env=myenv
+                )
+            except subp.ProcessExecutionError as e:
+                if e.exit_code != 1:
+                    util.logexc(
+                        LOG,
+                        "Failed growpart --dry-run for (%s, %s)",
+                        diskdev,
+                        partnum,
+                    )
+                    raise ResizeFailedException(e) from e
+                return (before, before)
+
+            try:
+                subp.subp(["growpart", diskdev, partnum], env=myenv)
+            except subp.ProcessExecutionError as e:
+                util.logexc(LOG, "Failed: growpart %s %s", diskdev, partnum)
+                raise ResizeFailedException(e) from e
 
         return (before, get_size(partdev))
 
 
 class ResizeGpart(object):
     def available(self):
-        if not util.which('gpart'):
-            return False
-        return True
+        myenv = os.environ.copy()
+        myenv["LANG"] = "C"
+
+        try:
+            (_out, err) = subp.subp(["gpart", "help"], env=myenv, rcs=[0, 1])
+            if re.search(r"gpart recover ", err):
+                return True
+
+        except subp.ProcessExecutionError:
+            pass
+        return False
 
     def resize(self, diskdev, partnum, partdev):
         """
@@ -129,22 +199,18 @@ class ResizeGpart(object):
         be recovered.
         """
         try:
-            util.subp(["gpart", "recover", diskdev])
-        except util.ProcessExecutionError as e:
+            subp.subp(["gpart", "recover", diskdev])
+        except subp.ProcessExecutionError as e:
             if e.exit_code != 0:
                 util.logexc(LOG, "Failed: gpart recover %s", diskdev)
-                raise ResizeFailedException(e)
+                raise ResizeFailedException(e) from e
 
         before = get_size(partdev)
         try:
-            util.subp(["gpart", "resize", "-i", partnum, diskdev])
-        except util.ProcessExecutionError as e:
+            subp.subp(["gpart", "resize", "-i", partnum, diskdev])
+        except subp.ProcessExecutionError as e:
             util.logexc(LOG, "Failed: gpart resize -i %s %s", partnum, diskdev)
-            raise ResizeFailedException(e)
-
-        # Since growing the FS requires a reboot, make sure we reboot
-        # first when this module has finished.
-        open('/var/run/reboot-required', 'a').close()
+            raise ResizeFailedException(e) from e
 
         return (before, get_size(partdev))
 
@@ -169,8 +235,13 @@ def device_part_info(devpath):
 
     # FreeBSD doesn't know of sysfs so just get everything we need from
     # the device, like /dev/vtbd0p2.
-    if util.system_info()["platform"].startswith('FreeBSD'):
-        m = re.search('^(/dev/.+)p([0-9])$', devpath)
+    if util.is_FreeBSD():
+        freebsd_part = "/dev/" + util.find_freebsd_part(devpath)
+        m = re.search("^(/dev/.+)p([0-9])$", freebsd_part)
+        return (m.group(1), m.group(2))
+    elif util.is_DragonFlyBSD():
+        dragonflybsd_part = "/dev/" + util.find_dragonflybsd_part(devpath)
+        m = re.search("^(/dev/.+)s([0-9])$", dragonflybsd_part)
         return (m.group(1), m.group(2))
 
     if not os.path.exists(syspath):
@@ -202,7 +273,20 @@ def devent2dev(devent):
         result = util.get_mount_info(devent)
         if not result:
             raise ValueError("Could not determine device of '%s' % dev_ent")
-        return result[0]
+        dev = result[0]
+
+    container = util.is_container()
+
+    # Ensure the path is a block device.
+    if dev == "/dev/root" and not container:
+        dev = util.rootdev_from_cmdline(util.get_cmdline())
+        if dev is None:
+            if os.path.exists(dev):
+                # if /dev/root exists, but we failed to convert
+                # that to a "real" /dev/ path device, then return it.
+                return dev
+            raise ValueError("Unable to find device '/dev/root'")
+    return dev
 
 
 def resize_devices(resizer, devices):
@@ -212,74 +296,108 @@ def resize_devices(resizer, devices):
         try:
             blockdev = devent2dev(devent)
         except ValueError as e:
-            info.append((devent, RESIZE.SKIPPED,
-                         "unable to convert to device: %s" % e,))
+            info.append(
+                (
+                    devent,
+                    RESIZE.SKIPPED,
+                    "unable to convert to device: %s" % e,
+                )
+            )
             continue
 
         try:
             statret = os.stat(blockdev)
         except OSError as e:
-            info.append((devent, RESIZE.SKIPPED,
-                         "stat of '%s' failed: %s" % (blockdev, e),))
+            info.append(
+                (
+                    devent,
+                    RESIZE.SKIPPED,
+                    "stat of '%s' failed: %s" % (blockdev, e),
+                )
+            )
             continue
 
-        if (not stat.S_ISBLK(statret.st_mode) and
-                not stat.S_ISCHR(statret.st_mode)):
-            info.append((devent, RESIZE.SKIPPED,
-                         "device '%s' not a block device" % blockdev,))
+        if not stat.S_ISBLK(statret.st_mode) and not stat.S_ISCHR(
+            statret.st_mode
+        ):
+            info.append(
+                (
+                    devent,
+                    RESIZE.SKIPPED,
+                    "device '%s' not a block device" % blockdev,
+                )
+            )
             continue
 
         try:
             (disk, ptnum) = device_part_info(blockdev)
         except (TypeError, ValueError) as e:
-            info.append((devent, RESIZE.SKIPPED,
-                         "device_part_info(%s) failed: %s" % (blockdev, e),))
+            info.append(
+                (
+                    devent,
+                    RESIZE.SKIPPED,
+                    "device_part_info(%s) failed: %s" % (blockdev, e),
+                )
+            )
             continue
 
         try:
             (old, new) = resizer.resize(disk, ptnum, blockdev)
             if old == new:
-                info.append((devent, RESIZE.NOCHANGE,
-                             "no change necessary (%s, %s)" % (disk, ptnum),))
+                info.append(
+                    (
+                        devent,
+                        RESIZE.NOCHANGE,
+                        "no change necessary (%s, %s)" % (disk, ptnum),
+                    )
+                )
             else:
-                info.append((devent, RESIZE.CHANGED,
-                             "changed (%s, %s) from %s to %s" %
-                             (disk, ptnum, old, new),))
+                info.append(
+                    (
+                        devent,
+                        RESIZE.CHANGED,
+                        "changed (%s, %s) from %s to %s"
+                        % (disk, ptnum, old, new),
+                    )
+                )
 
         except ResizeFailedException as e:
-            info.append((devent, RESIZE.FAILED,
-                         "failed to resize: disk=%s, ptnum=%s: %s" %
-                         (disk, ptnum, e),))
+            info.append(
+                (
+                    devent,
+                    RESIZE.FAILED,
+                    "failed to resize: disk=%s, ptnum=%s: %s"
+                    % (disk, ptnum, e),
+                )
+            )
 
     return info
 
 
 def handle(_name, cfg, _cloud, log, _args):
-    if _cloud.distro.name == "aix":
-        return
+    if "growpart" not in cfg:
+        log.debug(
+            "No 'growpart' entry in cfg.  Using default: %s" % DEFAULT_CONFIG
+        )
+        cfg["growpart"] = DEFAULT_CONFIG
 
-    if 'growpart' not in cfg:
-        log.debug("No 'growpart' entry in cfg.  Using default: %s" %
-                  DEFAULT_CONFIG)
-        cfg['growpart'] = DEFAULT_CONFIG
-
-    mycfg = cfg.get('growpart')
+    mycfg = cfg.get("growpart")
     if not isinstance(mycfg, dict):
-        log.warn("'growpart' in config was not a dict")
+        log.warning("'growpart' in config was not a dict")
         return
 
-    mode = mycfg.get('mode', "auto")
+    mode = mycfg.get("mode", "auto")
     if util.is_false(mode):
         log.debug("growpart disabled: mode=%s" % mode)
         return
 
-    if util.is_false(mycfg.get('ignore_growroot_disabled', False)):
+    if util.is_false(mycfg.get("ignore_growroot_disabled", False)):
         if os.path.isfile("/etc/growroot-disabled"):
             log.debug("growpart disabled: /etc/growroot-disabled exists")
             log.debug("use ignore_growroot_disabled to ignore")
             return
 
-    devices = util.get_cfg_option_list(cfg, "devices", ["/"])
+    devices = util.get_cfg_option_list(mycfg, "devices", ["/"])
     if not len(devices):
         log.debug("growpart: empty device list")
         return
@@ -292,12 +410,19 @@ def handle(_name, cfg, _cloud, log, _args):
             raise e
         return
 
-    resized = util.log_time(logfunc=log.debug, msg="resize_devices",
-                            func=resize_devices, args=(resizer, devices))
+    resized = util.log_time(
+        logfunc=log.debug,
+        msg="resize_devices",
+        func=resize_devices,
+        args=(resizer, devices),
+    )
     for (entry, action, msg) in resized:
         if action == RESIZE.CHANGED:
             log.info("'%s' resized: %s" % (entry, msg))
         else:
             log.debug("'%s' %s: %s" % (entry, action, msg))
 
-RESIZERS = (('growpart', ResizeGrowPart), ('gpart', ResizeGpart))
+
+RESIZERS = (("growpart", ResizeGrowPart), ("gpart", ResizeGpart))
+
+# vi: ts=4 expandtab

@@ -1,37 +1,23 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Canonical Ltd.
+# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Canonical Ltd.
-#    Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
-#    Copyright (C) 2012 Yahoo! Inc.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
 import jsonpatch
 
 from cloudinit import handlers
 from cloudinit import log as logging
-from cloudinit import mergers
-from cloudinit import util
-
-from cloudinit.settings import (PER_ALWAYS)
+from cloudinit import mergers, safeyaml, util
+from cloudinit.settings import PER_ALWAYS
 
 LOG = logging.getLogger(__name__)
 
-MERGE_HEADER = 'Merge-Type'
+MERGE_HEADER = "Merge-Type"
 
 # Due to the way the loading of yaml configuration was done previously,
 # where previously each cloud config part was appended to a larger yaml
@@ -50,28 +36,23 @@ MERGE_HEADER = 'Merge-Type'
 # a: 22
 #
 # This gets loaded into yaml with final result {'a': 22}
-DEF_MERGERS = mergers.string_extract_mergers('dict(replace)+list()+str()')
+DEF_MERGERS = mergers.string_extract_mergers("dict(replace)+list()+str()")
 CLOUD_PREFIX = "#cloud-config"
 JSONP_PREFIX = "#cloud-config-jsonp"
 
-# The file header -> content types this module will handle.
-CC_TYPES = {
-    JSONP_PREFIX: handlers.type_from_starts_with(JSONP_PREFIX),
-    CLOUD_PREFIX: handlers.type_from_starts_with(CLOUD_PREFIX),
-}
-
 
 class CloudConfigPartHandler(handlers.Handler):
+
+    # The content prefixes this handler understands.
+    prefixes = [CLOUD_PREFIX, JSONP_PREFIX]
+
     def __init__(self, paths, **_kwargs):
         handlers.Handler.__init__(self, PER_ALWAYS, version=3)
         self.cloud_buf = None
         self.cloud_fn = paths.get_ipath("cloud_config")
-        if 'cloud_config_path' in _kwargs:
+        if "cloud_config_path" in _kwargs:
             self.cloud_fn = paths.get_ipath(_kwargs["cloud_config_path"])
         self.file_names = []
-
-    def list_types(self):
-        return list(CC_TYPES.values())
 
     def _write_cloud_config(self):
         if not self.cloud_fn:
@@ -82,25 +63,25 @@ class CloudConfigPartHandler(handlers.Handler):
             file_lines.append("# from %s files" % (len(self.file_names)))
             for fn in self.file_names:
                 if not fn:
-                    fn = '?'
+                    fn = "?"
                 file_lines.append("# %s" % (fn))
             file_lines.append("")
         if self.cloud_buf is not None:
             # Something was actually gathered....
             lines = [
                 CLOUD_PREFIX,
-                '',
+                "",
             ]
             lines.extend(file_lines)
-            lines.append(util.yaml_dumps(self.cloud_buf))
+            lines.append(safeyaml.dumps(self.cloud_buf))
         else:
             lines = []
-        util.write_file(self.cloud_fn, "\n".join(lines), 0600)
+        util.write_file(self.cloud_fn, "\n".join(lines), 0o600)
 
     def _extract_mergers(self, payload, headers):
-        merge_header_headers = ''
-        for h in [MERGE_HEADER, 'X-%s' % (MERGE_HEADER)]:
-            tmp_h = headers.get(h, '')
+        merge_header_headers = ""
+        for h in [MERGE_HEADER, "X-%s" % (MERGE_HEADER)]:
+            tmp_h = headers.get(h, "")
             if tmp_h:
                 merge_header_headers = tmp_h
                 break
@@ -108,6 +89,9 @@ class CloudConfigPartHandler(handlers.Handler):
         # or the merge type from the headers or default to our own set
         # if neither exists (or is empty) from the later.
         payload_yaml = util.load_yaml(payload)
+        if payload_yaml is None:
+            raise ValueError("empty cloud config")
+
         mergers_yaml = mergers.dict_extract_mergers(payload_yaml)
         mergers_header = mergers.string_extract_mergers(merge_header_headers)
         all_mergers = []
@@ -138,8 +122,7 @@ class CloudConfigPartHandler(handlers.Handler):
         self.file_names = []
         self.cloud_buf = None
 
-    def handle_part(self, _data, ctype, filename,  # pylint: disable=W0221
-                    payload, _frequency, headers):  # pylint: disable=W0613
+    def handle_part(self, data, ctype, filename, payload, frequency, headers):
         if ctype == handlers.CONTENT_START:
             self._reset()
             return
@@ -151,7 +134,7 @@ class CloudConfigPartHandler(handlers.Handler):
             # First time through, merge with an empty dict...
             if self.cloud_buf is None or not self.file_names:
                 self.cloud_buf = {}
-            if ctype == CC_TYPES[JSONP_PREFIX]:
+            if ctype == handlers.INCLUSION_TYPES_MAP[JSONP_PREFIX]:
                 self._merge_patch(payload)
             else:
                 self._merge_part(payload, headers)
@@ -159,6 +142,16 @@ class CloudConfigPartHandler(handlers.Handler):
             for i in ("\n", "\r", "\t"):
                 filename = filename.replace(i, " ")
             self.file_names.append(filename.strip())
-        except:
-            util.logexc(LOG, "Failed at merging in cloud config part from %s",
-                        filename)
+        except ValueError as err:
+            LOG.warning(
+                "Failed at merging in cloud config part from %s: %s",
+                filename,
+                err,
+            )
+        except Exception:
+            util.logexc(
+                LOG, "Failed at merging in cloud config part from %s", filename
+            )
+
+
+# vi: ts=4 expandtab

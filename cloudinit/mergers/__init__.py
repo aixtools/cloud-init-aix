@@ -1,33 +1,18 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Yahoo! Inc.
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
 #
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
 import re
 
-from cloudinit import importer
-from cloudinit import log as logging
-from cloudinit import type_utils
+from cloudinit import importer, type_utils
 
 NAME_MTCH = re.compile(r"(^[a-zA-Z_][A-Za-z0-9_]*)\((.*?)\)$")
 
-LOG = logging.getLogger(__name__)
 DEF_MERGE_TYPE = "list()+dict()+str()"
-MERGER_PREFIX = 'm_'
-MERGER_ATTR = 'Merger'
+MERGER_PREFIX = "m_"
+MERGER_ATTR = "Merger"
 
 
 class UnknownMerger(object):
@@ -55,9 +40,6 @@ class UnknownMerger(object):
         if not meth:
             meth = self._handle_unknown
             args.insert(0, method_name)
-        LOG.debug("Merging '%s' into '%s' using method '%s' of '%s'",
-                  type_name, type_utils.obj_name(merge_with),
-                  meth.__name__, self)
         return meth(*args)
 
 
@@ -70,7 +52,7 @@ class LookupMerger(UnknownMerger):
             self._lookups = lookups
 
     def __str__(self):
-        return 'LookupMerger: (%s)' % (len(self._lookups))
+        return "LookupMerger: (%s)" % (len(self._lookups))
 
     # For items which can not be merged by the parent this object
     # will lookup in a internally maintained set of objects and
@@ -84,29 +66,28 @@ class LookupMerger(UnknownMerger):
                 # First one that has that method/attr gets to be
                 # the one that will be called
                 meth = getattr(merger, meth_wanted)
-                LOG.debug(("Merging using located merger '%s'"
-                            " since it had method '%s'"), merger, meth_wanted)
                 break
         if not meth:
-            return UnknownMerger._handle_unknown(self, meth_wanted,
-                                                 value, merge_with)
+            return UnknownMerger._handle_unknown(
+                self, meth_wanted, value, merge_with
+            )
         return meth(value, merge_with)
 
 
 def dict_extract_mergers(config):
     parsed_mergers = []
-    raw_mergers = config.pop('merge_how', None)
+    raw_mergers = config.pop("merge_how", None)
     if raw_mergers is None:
-        raw_mergers = config.pop('merge_type', None)
+        raw_mergers = config.pop("merge_type", None)
     if raw_mergers is None:
         return parsed_mergers
-    if isinstance(raw_mergers, (str, basestring)):
+    if isinstance(raw_mergers, str):
         return string_extract_mergers(raw_mergers)
     for m in raw_mergers:
         if isinstance(m, (dict)):
-            name = m['name']
+            name = m["name"]
             name = name.replace("-", "_").strip()
-            opts = m['settings']
+            opts = m["settings"]
         else:
             name = m[0]
             if len(m) >= 2:
@@ -129,8 +110,9 @@ def string_extract_mergers(merge_how):
             continue
         match = NAME_MTCH.match(m_name)
         if not match:
-            msg = ("Matcher identifer '%s' is not in the right format" %
-                   (m_name))
+            msg = "Matcher identifer '%s' is not in the right format" % (
+                m_name
+            )
             raise ValueError(msg)
         (m_name, m_ops) = match.groups()
         m_ops = m_ops.strip().split(",")
@@ -148,12 +130,15 @@ def construct(parsed_mergers):
     for (m_name, m_ops) in parsed_mergers:
         if not m_name.startswith(MERGER_PREFIX):
             m_name = MERGER_PREFIX + str(m_name)
-        merger_locs = importer.find_module(m_name,
-                                           [__name__],
-                                           [MERGER_ATTR])
+        merger_locs, looked_locs = importer.find_module(
+            m_name, [__name__], [MERGER_ATTR]
+        )
         if not merger_locs:
-            msg = ("Could not find merger module named '%s' "
-                   "with attribute '%s'") % (m_name, MERGER_ATTR)
+            msg = (
+                "Could not find merger module named '%s' "
+                "with attribute '%s' (searched %s)"
+                % (m_name, MERGER_ATTR, looked_locs)
+            )
             raise ImportError(msg)
         else:
             mod = importer.import_module(merger_locs[0])
@@ -165,3 +150,6 @@ def construct(parsed_mergers):
     for (attr, opts) in mergers_to_be:
         mergers.append(attr(root, opts))
     return root
+
+
+# vi: ts=4 expandtab

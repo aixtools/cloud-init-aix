@@ -1,29 +1,14 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Canonical Ltd.
+# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Canonical Ltd.
-#    Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
-#    Copyright (C) 2012 Yahoo! Inc.
-#
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
 import copy
 import os
 
 from cloudinit import log as logging
+from cloudinit.reporting import events
 
 LOG = logging.getLogger(__name__)
 
@@ -40,12 +25,19 @@ LOG = logging.getLogger(__name__)
 
 
 class Cloud(object):
-    def __init__(self, datasource, paths, cfg, distro, runners):
+    def __init__(self, datasource, paths, cfg, distro, runners, reporter=None):
         self.datasource = datasource
         self.paths = paths
         self.distro = distro
         self._cfg = cfg
         self._runners = runners
+        if reporter is None:
+            reporter = events.ReportEventStack(
+                name="unnamed-cloud-reporter",
+                description="unnamed-cloud-reporter",
+                reporting_enabled=False,
+            )
+        self.reporter = reporter
 
     # If a 'user' manipulates logging or logging services
     # it is typically useful to cause the logging to be
@@ -56,7 +48,7 @@ class Cloud(object):
 
     @property
     def cfg(self):
-        # Ensure that not indirectly modified
+        # Ensure that cfg is not indirectly modified
         return copy.deepcopy(self._cfg)
 
     def run(self, name, functor, args, freq=None, clear_on_fail=False):
@@ -65,11 +57,15 @@ class Cloud(object):
     def get_template_filename(self, name):
         fn = self.paths.template_tpl % (name)
         if not os.path.isfile(fn):
-            LOG.warn("No template found at %s for template named %s", fn, name)
+            LOG.warning(
+                "No template found in %s for template named %s",
+                os.path.dirname(fn),
+                name,
+            )
             return None
         return fn
 
-    # The rest of thes are just useful proxies
+    # The rest of these are just useful proxies
     def get_userdata(self, apply_filter=True):
         return self.datasource.get_userdata(apply_filter)
 
@@ -86,8 +82,10 @@ class Cloud(object):
     def get_locale(self):
         return self.datasource.get_locale()
 
-    def get_hostname(self, fqdn=False):
-        return self.datasource.get_hostname(fqdn=fqdn)
+    def get_hostname(self, fqdn=False, metadata_only=False):
+        return self.datasource.get_hostname(
+            fqdn=fqdn, metadata_only=metadata_only
+        )
 
     def device_name_to_device(self, name):
         return self.datasource.device_name_to_device(name)
@@ -100,3 +98,6 @@ class Cloud(object):
 
     def get_ipath(self, name=None):
         return self.paths.get_ipath(name)
+
+
+# vi: ts=4 expandtab

@@ -1,32 +1,19 @@
-## This is a cheetah template
+## template:basic
 Source: cloud-init
 Section: admin
-Priority: extra
+Priority: optional
 Maintainer: Scott Moser <smoser@ubuntu.com>
-Build-Depends: cdbs, 
-               debhelper (>= 5.0.38),
-               python (>= 2.6.6-3~),
-               python-nose,
-               pyflakes,
-               pylint,
-               python-setuptools,
-               python-cheetah,
-               python-mocker,
-               python-setuptools
+Build-Depends: ${build_depends}
 XS-Python-Version: all
-Standards-Version: 3.9.3
+Standards-Version: 3.9.6
 
 Package: cloud-init
 Architecture: all
-Depends: procps,
-         python,
-#for $r in $requires
-         ${r},
-#end for
-         python-software-properties | software-properties-common,
-         \${misc:Depends},
-Recommends: sudo
-XB-Python-Version: \${python:Versions}
+Depends: ${misc:Depends},
+         ${python3:Depends},
+         iproute2,
+         isc-dhcp-client
+Recommends: eatmydata, sudo, software-properties-common, gdisk
 Description: Init scripts for cloud instances
  Cloud instances need special scripts to run during initialisation
  to retrieve and install ssh keys and to let the user run various scripts.

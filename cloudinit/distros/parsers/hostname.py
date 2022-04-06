@@ -1,22 +1,10 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Yahoo! Inc.
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
 #
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
-from StringIO import StringIO
+from io import StringIO
 
 from cloudinit.distros.parsers import chop_comment
 
@@ -35,11 +23,11 @@ class HostnameConf(object):
         self.parse()
         contents = StringIO()
         for (line_type, components) in self._contents:
-            if line_type == 'blank':
+            if line_type == "blank":
                 contents.write("%s\n" % (components[0]))
-            elif line_type == 'all_comment':
+            elif line_type == "all_comment":
                 contents.write("%s\n" % (components[0]))
-            elif line_type == 'hostname':
+            elif line_type == "hostname":
                 (hostname, tail) = components
                 contents.write("%s%s\n" % (hostname, tail))
         # Ensure trailing newline
@@ -52,7 +40,7 @@ class HostnameConf(object):
     def hostname(self):
         self.parse()
         for (line_type, components) in self._contents:
-            if line_type == 'hostname':
+            if line_type == "hostname":
                 return components[0]
         return None
 
@@ -63,26 +51,28 @@ class HostnameConf(object):
         self.parse()
         replaced = False
         for (line_type, components) in self._contents:
-            if line_type == 'hostname':
+            if line_type == "hostname":
                 components[0] = str(your_hostname)
                 replaced = True
         if not replaced:
-            self._contents.append(('hostname', [str(your_hostname), '']))
+            self._contents.append(("hostname", [str(your_hostname), ""]))
 
     def _parse(self, contents):
         entries = []
         hostnames_found = set()
         for line in contents.splitlines():
             if not len(line.strip()):
-                entries.append(('blank', [line]))
+                entries.append(("blank", [line]))
                 continue
-            (head, tail) = chop_comment(line.strip(), '#')
+            (head, tail) = chop_comment(line.strip(), "#")
             if not len(head):
-                entries.append(('all_comment', [line]))
+                entries.append(("all_comment", [line]))
                 continue
-            entries.append(('hostname', [head, tail]))
+            entries.append(("hostname", [head, tail]))
             hostnames_found.add(head)
         if len(hostnames_found) > 1:
-            raise IOError("Multiple hostnames (%s) found!"
-                           % (hostnames_found))
+            raise IOError("Multiple hostnames (%s) found!" % (hostnames_found))
         return entries
+
+
+# vi: ts=4 expandtab

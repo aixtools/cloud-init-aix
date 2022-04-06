@@ -6,29 +6,23 @@
 
 . /etc/rc.subr
 
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 name="cloudfinal"
-command="/usr/bin/cloud_init"
+command="/usr/local/bin/cloud-init"
 start_cmd="cloudfinal_start"
 stop_cmd=":"
 rcvar="cloudinit_enable"
-start_precmd="cloudinit_override"
 start_cmd="cloudfinal_start"
-
-: ${cloudinit_config:="/etc/cloud/cloud.cfg"}
-
-cloudinit_override()
-{
-	# If there exist sysconfig/default variable override files use it...
-	if [ -f /etc/default/cloud-init ]; then
-		 . /etc/default/cloud-init
-	fi
-}
 
 cloudfinal_start()
 {
 	echo -n "${command} starting"
-	${command} ${cloudinit_config} modules --mode final
+	${command} modules --mode final
 }
 
 load_rc_config $name
+
+: ${cloudfinal_enable="NO"}
+
 run_rc_command "$1"

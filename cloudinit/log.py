@@ -1,34 +1,21 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Canonical Ltd.
+# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Canonical Ltd.
-#    Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
-#    Copyright (C) 2012 Yahoo! Inc.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
+import collections.abc
+import io
 import logging
 import logging.config
 import logging.handlers
-
-import collections
 import os
 import sys
-
-from StringIO import StringIO
+import time
 
 # Logging levels for easy access
 CRITICAL = logging.CRITICAL
@@ -41,13 +28,24 @@ DEBUG = logging.DEBUG
 NOTSET = logging.NOTSET
 
 # Default basic format
-DEF_CON_FORMAT = '%(asctime)s - %(filename)s[%(levelname)s]: %(message)s'
+DEF_CON_FORMAT = "%(asctime)s - %(filename)s[%(levelname)s]: %(message)s"
+
+# Always format logging timestamps as UTC time
+logging.Formatter.converter = time.gmtime
 
 
-def setupBasicLogging(level=DEBUG):
+def setupBasicLogging(level=DEBUG, formatter=None):
+    if not formatter:
+        formatter = logging.Formatter(DEF_CON_FORMAT)
     root = logging.getLogger()
+    for handler in root.handlers:
+        if hasattr(handler, "stream") and hasattr(handler.stream, "name"):
+            if handler.stream.name == "<stderr>":
+                handler.setLevel(level)
+                return
+    # Didn't have an existing stderr handler; create a new handler
     console = logging.StreamHandler(sys.stderr)
-    console.setFormatter(logging.Formatter(DEF_CON_FORMAT))
+    console.setFormatter(formatter)
     console.setLevel(level)
     root.addHandler(console)
     root.setLevel(level)
@@ -71,18 +69,18 @@ def setupLogging(cfg=None):
         cfg = {}
 
     log_cfgs = []
-    log_cfg = cfg.get('logcfg')
-    if log_cfg and isinstance(log_cfg, (str, basestring)):
+    log_cfg = cfg.get("logcfg")
+    if log_cfg and isinstance(log_cfg, str):
         # If there is a 'logcfg' entry in the config,
         # respect it, it is the old keyname
         log_cfgs.append(str(log_cfg))
     elif "log_cfgs" in cfg:
-        for a_cfg in cfg['log_cfgs']:
-            if isinstance(a_cfg, (basestring, str)):
+        for a_cfg in cfg["log_cfgs"]:
+            if isinstance(a_cfg, str):
                 log_cfgs.append(a_cfg)
-            elif isinstance(a_cfg, (collections.Iterable)):
+            elif isinstance(a_cfg, (collections.abc.Iterable)):
                 cfg_str = [str(c) for c in a_cfg]
-                log_cfgs.append('\n'.join(cfg_str))
+                log_cfgs.append("\n".join(cfg_str))
             else:
                 log_cfgs.append(str(a_cfg))
 
@@ -98,7 +96,7 @@ def setupLogging(cfg=None):
                 # is acting as a file)
                 pass
             else:
-                log_cfg = StringIO(log_cfg)
+                log_cfg = io.StringIO(log_cfg)
             # Attempt to load its config
             logging.config.fileConfig(log_cfg)
             # The first one to work wins!
@@ -111,30 +109,26 @@ def setupLogging(cfg=None):
             pass
 
     # If it didn't work, at least setup a basic logger (if desired)
-    basic_enabled = cfg.get('log_basic', True)
+    basic_enabled = cfg.get("log_basic", True)
 
-    sys.stderr.write(("WARN: no logging configured!"
-                      " (tried %s configs)\n") % (am_tried))
+    sys.stderr.write(
+        "WARN: no logging configured! (tried %s configs)\n" % (am_tried)
+    )
     if basic_enabled:
         sys.stderr.write("Setting up basic logging...\n")
         setupBasicLogging()
 
 
-def getLogger(name='cloudinit'):
+def getLogger(name="cloudinit"):
     return logging.getLogger(name)
 
 
-# Fixes this annoyance...
-# No handlers could be found for logger XXX annoying output...
-try:
-    from logging import NullHandler
-except ImportError:
-    class NullHandler(logging.Handler):
-        def emit(self, record):
-            pass
-
-
 def _resetLogger(log):
+    """Remove all current handlers, unset log level and add a NullHandler.
+
+    (Adding the NullHandler avoids "No handlers could be found for logger XXX"
+    messages.)
+    """
     if not log:
         return
     handlers = list(log.handlers)
@@ -143,7 +137,7 @@ def _resetLogger(log):
         h.close()
         log.removeHandler(h)
     log.setLevel(NOTSET)
-    log.addHandler(NullHandler())
+    log.addHandler(logging.NullHandler())
 
 
 def resetLogging():
@@ -152,3 +146,5 @@ def resetLogging():
 
 
 resetLogging()
+
+# vi: ts=4 expandtab

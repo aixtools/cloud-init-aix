@@ -1,24 +1,12 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Canonical Ltd.
+# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Canonical Ltd.
-#    Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
-#    Copyright (C) 2012 Yahoo! Inc.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
 import copy
 
@@ -35,7 +23,7 @@ class Filter(object):
         self.allow_none = allow_none
 
     def _select(self, message):
-        msg_idx = message.get('Launch-Index', None)
+        msg_idx = message.get("Launch-Index", None)
         if self.allow_none and msg_idx is None:
             return True
         msg_idx = util.safe_int(msg_idx)
@@ -59,9 +47,12 @@ class Filter(object):
                     new_msgs.append(m)
                 else:
                     discarded += 1
-            LOG.debug(("Discarding %s multipart messages "
-                       "which do not match launch index %s"),
-                       discarded, self.wanted_idx)
+            LOG.debug(
+                "Discarding %s multipart messages "
+                "which do not match launch index %s",
+                discarded,
+                self.wanted_idx,
+            )
             new_message = copy.copy(message)
             new_message.set_payload(new_msgs)
             new_message[ud.ATTACHMENT_FIELD] = str(len(new_msgs))
@@ -73,3 +64,6 @@ class Filter(object):
         if self.wanted_idx is None:
             return root_message
         return self._do_filter(root_message)
+
+
+# vi: ts=4 expandtab

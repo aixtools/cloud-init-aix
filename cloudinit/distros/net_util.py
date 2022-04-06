@@ -1,24 +1,12 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2012 Canonical Ltd.
+# Copyright (C) 2012, 2013 Hewlett-Packard Development Company, L.P.
+# Copyright (C) 2012 Yahoo! Inc.
 #
-#    Copyright (C) 2012 Canonical Ltd.
-#    Copyright (C) 2012, 2013 Hewlett-Packard Development Company, L.P.
-#    Copyright (C) 2012 Yahoo! Inc.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
+# Author: Joshua Harlow <harlowja@yahoo-inc.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#    Author: Joshua Harlow <harlowja@yahoo-inc.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
 
 # This is a util function to translate debian based distro interface blobs as
@@ -79,6 +67,12 @@
 #     }
 # }
 
+from cloudinit.net.network_state import (
+    mask_and_ipv4_to_bcast_addr,
+    net_prefix_to_ipv4_mask,
+)
+
+
 def translate_network(settings):
     # Get the standard cmd, args from the ubuntu format
     entries = []
@@ -94,7 +88,7 @@ def translate_network(settings):
     ifaces = []
     consume = {}
     for (cmd, args) in entries:
-        if cmd == 'iface':
+        if cmd == "iface":
             if consume:
                 ifaces.append(consume)
                 consume = {}
@@ -103,17 +97,21 @@ def translate_network(settings):
             consume[cmd] = args
     # Check if anything left over to consume
     absorb = False
-    for (cmd, args) in consume.iteritems():
-        if cmd == 'iface':
+    for (cmd, args) in consume.items():
+        if cmd == "iface":
             absorb = True
     if absorb:
         ifaces.append(consume)
     # Now translate
     real_ifaces = {}
     for info in ifaces:
-        if 'iface' not in info:
+        if "iface" not in info:
             continue
-        iface_details = info['iface'].split(None)
+        iface_details = info["iface"].split(None)
+        # Check if current device *may* have an ipv6 IP
+        use_ipv6 = False
+        if "inet6" in iface_details:
+            use_ipv6 = True
         dev_name = None
         if len(iface_details) >= 1:
             dev = iface_details[0].strip().lower()
@@ -122,50 +120,74 @@ def translate_network(settings):
         if not dev_name:
             continue
         iface_info = {}
+        iface_info["ipv6"] = {}
         if len(iface_details) >= 3:
             proto_type = iface_details[2].strip().lower()
             # Seems like this can be 'loopback' which we don't
             # really care about
-            if proto_type in ['dhcp', 'static']:
-                iface_info['bootproto'] = proto_type
-            if iface_details[1].strip().lower() == "inet6":
-                iface_info['ipv6'] = True
-            else:
-                iface_info['ipv6'] = False
-            if iface_details[1].strip().lower() == "inet":
-                iface_info['ipv4'] = True
-            else:
-                iface_info['ipv4'] = False
+            if proto_type in ["dhcp", "static"]:
+                iface_info["bootproto"] = proto_type
         # These can just be copied over
-        for k in ['netmask', 'address', 'gateway', 'broadcast', 'mtu']:
-            if k in info:
-                val = info[k].strip().lower()
-                if val:
-                    iface_info[k] = val
-        # Name server info provided??
-        if 'dns-nameservers' in info:
-            iface_info['dns-nameservers'] = info['dns-nameservers'].split()
-        # Name server search info provided??
-        if 'dns-search' in info:
-            iface_info['dns-search'] = info['dns-search'].split()
-        # Is any mac address spoofing going on??
-        if 'hwaddress' in info:
-            hw_info = info['hwaddress'].lower().strip()
-            hw_split = hw_info.split(None, 1)
-            if len(hw_split) == 2 and hw_split[0].startswith('ether'):
-                hw_addr = hw_split[1]
-                if hw_addr:
-                    iface_info['hwaddress'] = hw_addr
-        real_ifaces[dev_name] = iface_info
+        if use_ipv6:
+            for k in ["address", "gateway"]:
+                if k in info:
+                    val = info[k].strip().lower()
+                    if val:
+                        iface_info["ipv6"][k] = val
+        else:
+            for k in ["netmask", "address", "gateway", "broadcast"]:
+                if k in info:
+                    val = info[k].strip().lower()
+                    if val:
+                        iface_info[k] = val
+            # handle static ip configurations using
+            # ipaddress/prefix-length format
+            if "address" in iface_info:
+                if "netmask" not in iface_info:
+                    # check if the address has a network prefix
+                    addr, _, prefix = iface_info["address"].partition("/")
+                    if prefix:
+                        iface_info["netmask"] = net_prefix_to_ipv4_mask(prefix)
+                        iface_info["address"] = addr
+                        # if we set the netmask, we also can set the broadcast
+                        iface_info["broadcast"] = mask_and_ipv4_to_bcast_addr(
+                            iface_info["netmask"], addr
+                        )
+
+            # Name server info provided??
+            if "dns-nameservers" in info:
+                iface_info["dns-nameservers"] = info["dns-nameservers"].split()
+            # Name server search info provided??
+            if "dns-search" in info:
+                iface_info["dns-search"] = info["dns-search"].split()
+            # Is any mac address spoofing going on??
+            if "hwaddress" in info:
+                hw_info = info["hwaddress"].lower().strip()
+                hw_split = hw_info.split(None, 1)
+                if len(hw_split) == 2 and hw_split[0].startswith("ether"):
+                    hw_addr = hw_split[1]
+                    if hw_addr:
+                        iface_info["hwaddress"] = hw_addr
+        # If ipv6 is enabled, device will have multiple IPs, so we need to
+        # update the dictionary instead of overwriting it...
+        if dev_name in real_ifaces:
+            real_ifaces[dev_name].update(iface_info)
+        else:
+            real_ifaces[dev_name] = iface_info
     # Check for those that should be started on boot via 'auto'
     for (cmd, args) in entries:
-        if cmd == 'auto':
+        args = args.split(None)
+        if not args:
+            continue
+        dev_name = args[0].strip().lower()
+        if cmd == "auto":
             # Seems like auto can be like 'auto eth0 eth0:1' so just get the
             # first part out as the device name
-            args = args.split(None)
-            if not args:
-                continue
-            dev_name = args[0].strip().lower()
             if dev_name in real_ifaces:
-                real_ifaces[dev_name]['auto'] = True
+                real_ifaces[dev_name]["auto"] = True
+        if cmd == "iface" and "inet6" in args:
+            real_ifaces[dev_name]["inet6"] = True
     return real_ifaces
+
+
+# vi: ts=4 expandtab

@@ -1,33 +1,42 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2009-2010 Canonical Ltd.
+# Copyright (C) 2012, 2013 Hewlett-Packard Development Company, L.P.
 #
-#    Copyright (C) 2009-2010 Canonical Ltd.
-#    Copyright (C) 2012, 2013 Hewlett-Packard Development Company, L.P.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
 
-# Ensure this is aliased to a name not 'distros'
-# since the module attribute 'distros'
-# is a list of distros that are supported, not a sub-module
-from cloudinit import distros as ds
+"""
+SSH Import Id
+-------------
+**Summary:** import SSH id
 
-from cloudinit import util
+This module imports SSH keys from either a public keyserver, usually launchpad
+or github using ``ssh-import-id``. Keys are referenced by the username they are
+associated with on the keyserver. The keyserver can be specified by prepending
+either ``lp:`` for launchpad or ``gh:`` for github to the username.
+
+**Internal name:** ``cc_ssh_import_id``
+
+**Module frequency:** per instance
+
+**Supported distros:** ubuntu, debian
+
+**Config keys**::
+
+    ssh_import_id:
+        - user
+        - gh:user
+        - lp:user
+"""
+
 import pwd
 
+from cloudinit import subp, util
+from cloudinit.distros import ug_util
+
 # https://launchpad.net/ssh-import-id
-distros = ['ubuntu', 'debian']
+distros = ["ubuntu", "debian"]
 
 
 def handle(_name, cfg, cloud, log, args):
@@ -43,25 +52,26 @@ def handle(_name, cfg, cloud, log, args):
         return
 
     # import for cloudinit created users
-    (users, _groups) = ds.normalize_users_groups(cfg, cloud.distro)
+    (users, _groups) = ug_util.normalize_users_groups(cfg, cloud.distro)
     elist = []
     for (user, user_cfg) in users.items():
         import_ids = []
-        if user_cfg['default']:
+        if user_cfg["default"]:
             import_ids = util.get_cfg_option_list(cfg, "ssh_import_id", [])
         else:
             try:
-                import_ids = user_cfg['ssh_import_id']
-            except:
+                import_ids = user_cfg["ssh_import_id"]
+            except Exception:
                 log.debug("User %s is not configured for ssh_import_id", user)
                 continue
 
         try:
             import_ids = util.uniq_merge(import_ids)
             import_ids = [str(i) for i in import_ids]
-        except:
-            log.debug("User %s is not correctly configured for ssh_import_id",
-                      user)
+        except Exception:
+            log.debug(
+                "User %s is not correctly configured for ssh_import_id", user
+            )
             continue
 
         if not len(import_ids):
@@ -70,8 +80,9 @@ def handle(_name, cfg, cloud, log, args):
         try:
             import_ssh_ids(import_ids, user, log)
         except Exception as exc:
-            util.logexc(log, "ssh-import-id failed for: %s %s", user,
-                        import_ids)
+            util.logexc(
+                log, "ssh-import-id failed for: %s %s", user, import_ids
+            )
             elist.append(exc)
 
     if len(elist):
@@ -85,15 +96,18 @@ def import_ssh_ids(ids, user, log):
         return
 
     try:
-        _check = pwd.getpwnam(user)
+        pwd.getpwnam(user)
     except KeyError as exc:
         raise exc
 
     cmd = ["sudo", "-Hu", user, "ssh-import-id"] + ids
-    log.debug("Importing ssh ids for user %s.", user)
+    log.debug("Importing SSH ids for user %s.", user)
 
     try:
-        util.subp(cmd, capture=False)
-    except util.ProcessExecutionError as exc:
-        util.logexc(log, "Failed to run command to import %s ssh ids", user)
+        subp.subp(cmd, capture=False)
+    except subp.ProcessExecutionError as exc:
+        util.logexc(log, "Failed to run command to import %s SSH ids", user)
         raise exc
+
+
+# vi: ts=4 expandtab

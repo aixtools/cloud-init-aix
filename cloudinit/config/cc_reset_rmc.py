@@ -1,126 +1,142 @@
-# =================================================================
+# (c) Copyright IBM Corp. 2020 All Rights Reserved
 #
-#    (c) Copyright IBM Corp. 2015 
+# Author: Aman Kumar Sinha <amansi26@in.ibm.com>
 #
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-# =================================================================
+# This file is part of cloud-init. See LICENSE file for license information.
 
+
+"""
+Reset RMC
+------------
+**Summary:** reset rsct node id
+
+Reset RMC module is IBM PowerVM Hypervisor specific
+
+Reliable Scalable Cluster Technology (RSCT) is a set of software components,
+that  together provide a comprehensive clustering environment (RAS features)
+for IBM PowerVM based virtual machines. RSCT includes the Resource monitoring
+and control (RMC) subsystem. RMC is a generalized framework used for managing,
+monitoring, and manipulating resources. RMC runs as a daemon process on
+individual machines and needs creation of unique node id and restarts
+during VM boot.
+More details refer
+https://www.ibm.com/support/knowledgecenter/en/SGVKBA_3.2/admin/bl503_ovrv.htm
+
+This module handles
+- creation of the unique RSCT node id to every instance/virtual machine
+  and ensure once set, it isn't changed subsequently by cloud-init.
+  In order to do so, it restarts RSCT service.
+
+Prerequisite of using this module is to install RSCT packages.
+
+**Internal name:** ``cc_reset_rmc``
+
+**Module frequency:** per instance
+
+**Supported distros:** rhel, sles and ubuntu
+
+"""
 import os
-import time
 
+from cloudinit import log as logging
+from cloudinit import subp, util
 from cloudinit.settings import PER_INSTANCE
-from cloudinit import util
 
 frequency = PER_INSTANCE
 
-PIDOF = 'pidof'
-RMCCTRL = '/usr/sbin/rsct/bin/rmcctrl'
-RECFGCT = '/usr/sbin/rsct/install/bin/recfgct'
-SRCMSTR = '/sbin/srcmstr'
+# RMCCTRL is expected to be in system PATH (/opt/rsct/bin)
+# The symlink for RMCCTRL and RECFGCT are
+# /usr/sbin/rsct/bin/rmcctrl and
+# /usr/sbin/rsct/install/bin/recfgct respectively.
+RSCT_PATH = "/opt/rsct/install/bin"
+RMCCTRL = "rmcctrl"
+RECFGCT = "recfgct"
 
-NODE_ID_FILE = '/etc/ct_node_id'
+LOG = logging.getLogger(__name__)
 
-SRCMSTR_TIMEOUT_SECONDS = 30
+NODE_ID_FILE = "/etc/ct_node_id"
 
 
-def handle(name, _cfg, _cloud, log, _args):
-    required_tools = [RMCCTRL, RECFGCT]
-    for tool in required_tools:
-        if not os.path.isfile(tool):
-            log.debug('%s is not found but is required, therefore not '
-                      'attempting to reset RMC.' % tool)
-            return
+def handle(name, _cfg, cloud, _log, _args):
+    # Ensuring node id has to be generated only once during first boot
+    if cloud.datasource.platform_type == "none":
+        LOG.debug("Skipping creation of new ct_node_id node")
+        return
 
-    log.debug('Attempting to reset RMC.')
-    system_info = util.system_info()
+    if not os.path.isdir(RSCT_PATH):
+        LOG.debug("module disabled, RSCT_PATH not present")
+        return
 
-    node_id_before = get_node_id(log)
-    log.debug('Node ID at beginning of module: %s' % node_id_before)
-
-    # Stop the RMC subsystem and all resource managers so that we can make
-    # some changes to it
+    orig_path = os.environ.get("PATH")
     try:
-        util.subp([RMCCTRL, '-z'])
-    except:
-        util.logexc(log, 'Failed to stop the RMC subsystem.')
-        raise
-
-    if 'linux' in system_info['platform'].lower():
-        recycle_srcmstr_process(log)
-
-    reconfigure_rsct_subsystems(log)
-
-    node_id_after = get_node_id(log)
-    log.debug('Node ID at end of module: %s' % node_id_after)
-
-    if node_id_after == node_id_before:
-        msg = 'New node ID did not get generated.'
-        log.error(msg)
-        raise Exception(msg)
+        add_path(orig_path)
+        reset_rmc()
+    finally:
+        if orig_path:
+            os.environ["PATH"] = orig_path
+        else:
+            del os.environ["PATH"]
 
 
-def reconfigure_rsct_subsystems(log):
+def reconfigure_rsct_subsystems():
     # Reconfigure the RSCT subsystems, which includes removing all RSCT data
     # under the /var/ct directory, generating a new node ID, and making it
     # appear as if the RSCT components were just installed
     try:
-        out = util.subp([RECFGCT])[0]
-        log.debug(out.strip())
-    except util.ProcessExecutionError:
-        util.logexc(log, 'Failed to reconfigure the RSCT subsystems.')
+        out = subp.subp([RECFGCT])[0]
+        LOG.debug(out.strip())
+        return out
+    except subp.ProcessExecutionError:
+        util.logexc(LOG, "Failed to reconfigure the RSCT subsystems.")
         raise
 
 
-def get_node_id(log):
+def get_node_id():
     try:
-        node_id = util.subp(['/usr/bin/head', '-n1', NODE_ID_FILE])[0].strip()
+        fp = util.load_file(NODE_ID_FILE)
+        node_id = fp.split("\n")[0]
         return node_id
-    except util.ProcessExecutionError:
-        util.logexc(log, 'Failed to get node ID from file %s.' % NODE_ID_FILE)
+    except Exception:
+        util.logexc(LOG, "Failed to get node ID from file %s." % NODE_ID_FILE)
         raise
 
 
-def recycle_srcmstr_process(log):
+def add_path(orig_path):
+    # Adding the RSCT_PATH to env standard path
+    # So thet cloud init automatically find and
+    # run RECFGCT to create new node_id.
+    suff = ":" + orig_path if orig_path else ""
+    os.environ["PATH"] = RSCT_PATH + suff
+    return os.environ["PATH"]
+
+
+def rmcctrl():
+    # Stop the RMC subsystem and all resource managers so that we can make
+    # some changes to it
     try:
-        out = util.subp([PIDOF, SRCMSTR])[0]
-    except util.ProcessExecutionError:
-        util.logexc(log, 'Failed to get PID of srcmstr process.')
+        return subp.subp([RMCCTRL, "-z"])
+    except Exception:
+        util.logexc(LOG, "Failed to stop the RMC subsystem.")
         raise
 
-    srcmstr_pid_before = int(out)
-    log.debug('Recycling srcmstr process with PID of %d.' %
-              srcmstr_pid_before)
-    try:
-        os.kill(srcmstr_pid_before, 9)
-    except:
-        util.logexc(log, 'Failed to kill the srcmstr process.')
-        raise
 
-    # wait for srcmstr to come back up
-    start_time = time.time()
-    while True:
-        time.sleep(0.5)
-        if time.time() - start_time >= SRCMSTR_TIMEOUT_SECONDS:
-            msg = ('srcmstr process failed to come back up within %d seconds.'
-                   % SRCMSTR_TIMEOUT_SECONDS)
-            log.error(msg)
-            raise Exception(msg)
-        try:
-            new_srcmstr_pid = int(util.subp([PIDOF, SRCMSTR])[0])
-            log.debug('srcmstr process came back up with PID of %d.' %
-                      new_srcmstr_pid)
-            break
-        except util.ProcessExecutionError:
-            log.debug('Still waiting for srcmstr process to come '
-                      'back up...')
-            continue
+def reset_rmc():
+    LOG.debug("Attempting to reset RMC.")
+
+    node_id_before = get_node_id()
+    LOG.debug("Node ID at beginning of module: %s", node_id_before)
+
+    # Stop the RMC subsystem and all resource managers so that we can make
+    # some changes to it
+    rmcctrl()
+    reconfigure_rsct_subsystems()
+
+    node_id_after = get_node_id()
+    LOG.debug("Node ID at end of module: %s", node_id_after)
+
+    # Check if new node ID is generated or not
+    # by comparing old and new node ID
+    if node_id_after == node_id_before:
+        msg = "New node ID did not get generated."
+        LOG.error(msg)
+        raise Exception(msg)

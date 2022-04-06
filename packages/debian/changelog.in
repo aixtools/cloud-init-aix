@@ -1,5 +1,5 @@
-## This is a cheetah template
-cloud-init (${version}~bzr${revision}-1) UNRELEASED; urgency=low
+## template:basic
+cloud-init (${version_long}-1~bddeb${release_suffix}) ${debian_release}; urgency=low
 
   * build
 

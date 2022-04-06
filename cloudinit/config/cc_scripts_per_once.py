@@ -1,41 +1,52 @@
-# vi: ts=4 expandtab
+# Copyright (C) 2011 Canonical Ltd.
+# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
 #
-#    Copyright (C) 2011 Canonical Ltd.
-#    Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Author: Scott Moser <scott.moser@canonical.com>
+# Author: Juerg Haefliger <juerg.haefliger@hp.com>
 #
-#    Author: Scott Moser <scott.moser@canonical.com>
-#    Author: Juerg Haefliger <juerg.haefliger@hp.com>
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License version 3, as
-#    published by the Free Software Foundation.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# This file is part of cloud-init. See LICENSE file for license information.
+
+"""
+Scripts Per Once
+----------------
+**Summary:** run one time scripts
+
+Any scripts in the ``scripts/per-once`` directory on the datasource will be run
+only once. Changes to the instance will not force a re-run. The only way to
+re-run these scripts is to run the clean subcommand and reboot. Scripts will
+be run in alphabetical order. This module does not accept any config keys.
+
+**Internal name:** ``cc_scripts_per_once``
+
+**Module frequency:** per once
+
+**Supported distros:** all
+"""
 
 import os
 
-from cloudinit import util
-
+from cloudinit import subp
 from cloudinit.settings import PER_ONCE
 
 frequency = PER_ONCE
 
-SCRIPT_SUBDIR = 'per-once'
+SCRIPT_SUBDIR = "per-once"
 
 
 def handle(name, _cfg, cloud, log, _args):
     # Comes from the following:
     # https://forums.aws.amazon.com/thread.jspa?threadID=96918
-    runparts_path = os.path.join(cloud.get_cpath(), 'scripts', SCRIPT_SUBDIR)
+    runparts_path = os.path.join(cloud.get_cpath(), "scripts", SCRIPT_SUBDIR)
     try:
-        util.runparts(runparts_path)
-    except:
-        log.warn("Failed to run module %s (%s in %s)",
-                 name, SCRIPT_SUBDIR, runparts_path)
+        subp.runparts(runparts_path)
+    except Exception:
+        log.warning(
+            "Failed to run module %s (%s in %s)",
+            name,
+            SCRIPT_SUBDIR,
+            runparts_path,
+        )
         raise
+
+
+# vi: ts=4 expandtab

@@ -1,6 +1,8 @@
+# Needed generally in tests
 httpretty>=0.7.1
-mocker
-nose
-pep8
-pyflakes
-pylint
+pytest
+pytest-cov
+
+# Only really needed on older versions of python
+setuptools
+jsonschema
