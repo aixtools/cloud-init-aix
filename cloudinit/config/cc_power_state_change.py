@@ -64,6 +64,8 @@ from cloudinit.settings import PER_INSTANCE
 frequency = PER_INSTANCE
 
 EXIT_FAIL = 254
+# ToDo: create util.is_AIX()
+AIX = 0
 
 
 def givecmdline(pid):
@@ -78,6 +80,9 @@ def givecmdline(pid):
             line = output.splitlines()[1]
             m = re.search(r"\d+ (\w|\.|-)+\s+(/\w.+)", line)
             return m.group(2)
+        elif AIX:
+            (ps_out, _err) = util.subp(["/usr/bin/ps", "-p", str(pid), "-oargs="], rcs=[0, 1])
+            returnps_out.strip()
         else:
             return util.load_file("/proc/%s/cmdline" % pid)
     except IOError:
@@ -116,6 +121,9 @@ def check_condition(cond, log=None):
 
 
 def handle(_name, cfg, cloud, log, _args):
+    if _cloud.distro.name == "aix":
+        global AIX
+        AIX = 1
     try:
         (args, timeout, condition) = load_power_state(cfg, cloud.distro)
         if args is None:
@@ -163,8 +171,18 @@ def load_power_state(cfg, distro):
     if not isinstance(pstate, dict):
         raise TypeError("power_state is not a dict.")
 
+# TODO: Add opt_map to distro.shutdown_options_map
+# to replace:
+#-     if AIX:
+#-         opt_map = {'halt': '-h', 'poweroff': '-p', 'reboot': '-r'}
+#-     else:
+#-         opt_map = {'halt': '-H', 'poweroff': '-P', 'reboot': '-r'}
     modes_ok = ["halt", "poweroff", "reboot"]
     mode = pstate.get("mode")
+# -     if mode not in opt_map:
+# -         raise TypeError("power_state[mode] required, must be one of: %s." %
+# -                         ','.join(opt_map.keys()))
+
     if mode not in distro.shutdown_options_map:
         raise TypeError(
             "power_state[mode] required, must be one of: %s. found: '%s'."

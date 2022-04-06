@@ -1,0 +1,42 @@
+./cloudinit/config/cc_growpart.py
+-- Done
+./cloudinit/config/cc_power_state_change.py
+cloudinit/config/cc_power_state_change.py 
+
+Needs: util.is_AIX()
+
+Needs: distro.shutdown_options_map to replace:
+
+-     if AIX:
+-         opt_map = {'halt': '-h', 'poweroff': '-p', 'reboot': '-r'}
+-     else:
+-         opt_map = {'halt': '-H', 'poweroff': '-P', 'reboot': '-r'}
+-
++     modes_ok = ["halt", "poweroff", "reboot"]
+      mode = pstate.get("mode")
+-     if mode not in opt_map:
+-         raise TypeError("power_state[mode] required, must be one of: %s." %
+-                         ','.join(opt_map.keys()))
++     if mode not in distro.shutdown_options_map:
++         raise TypeError(
++             "power_state[mode] required, must be one of: %s. found: '%s'."
++             % (",".join(modes_ok), mode)
++         )
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+./cloudinit/config/cc_resizefs.py
+./cloudinit/config/cc_resolv_conf.py
+./cloudinit/config/cc_set_hostname_from_dns.py
+./cloudinit/config/cc_set_passwords.py
+./cloudinit/config/cc_update_bootlist.py
+./cloudinit/config/cc_write_files.py
+./cloudinit/distros/__init__.py
+./cloudinit/distros/aix.py
+./cloudinit/distros/aix_util.py
+./cloudinit/netinfo.py
+./cloudinit/settings.py
+./cloudinit/sources/DataSourceConfigDrive.py
+./cloudinit/sources/DataSourceNoCloud.py
+./cloudinit/sources/__init__.py
+./cloudinit/util.py
+./setup.py
