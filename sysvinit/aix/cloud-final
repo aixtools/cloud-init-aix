@@ -1,5 +1,4 @@
-#!/opt/freeware/bin/bash
-
+#!/usr/bin/ksh -e
 #
 #    Copyright (C) 2012 Yahoo! Inc.
 #
@@ -71,6 +70,9 @@ start() {
     RETVAL=$?
     return $RETVAL
 }
+
+# stop is often an alias on AIX for sh and ksh - remove just in case
+unalias stop
 
 stop() {
     echo -n $"Shutting down $prog: "

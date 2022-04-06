@@ -1,5 +1,4 @@
-#!/opt/freeware/bin/bash
-
+#!/usr/bin/ksh -e
 #
 #    Copyright (C) 2012 Yahoo! Inc.
 #
@@ -55,8 +54,8 @@
 RETVAL=0
 
 prog="cloud-init"
-cloud_init="/opt/freeware/bin/cloud-init"
-conf="/opt/freeware/etc/cloud/cloud.cfg"
+cloud_init="/bin/cloud-init"
+conf="/etc/cloud/cloud.cfg"
 
 # If there exist sysconfig/default variable override files use it...
 [ -f /etc/sysconfig/cloud-init ] && . /etc/sysconfig/cloud-init
@@ -71,6 +70,9 @@ start() {
     RETVAL=$?
     return $RETVAL
 }
+
+# stop is often an alias on AIX for sh and ksh - remove just in case
+unalias stop
 
 stop() {
     echo -n $"Shutting down $prog: "
